@@ -77,6 +77,7 @@ def layer_norm(
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     eps: float = 1e-5,
+    num_warps=4,
 ):
     assert x.is_cuda
     assert weight.is_cuda
@@ -107,6 +108,7 @@ def layer_norm(
         eps=eps,
         BLOCK_SIZE=BLOCK_SIZE,
         HAS_BIAS=bias is not None,
+        num_warps=num_warps,
     )
 
     return y
