@@ -78,22 +78,26 @@ def _layer_norm_fwd_kernel(
     )
 
 @triton.jit
-def _layer_norm_bwd_dx_kernel(
+def _layer_norm_bwd_dx_fused_kernel(
+    dx_ptr,
     dy_ptr,
+
+    partial_dw_ptr,
+    partial_db_ptr,
+
     x_ptr,
     weight_ptr,
 
     mean_ptr,
     rstd_ptr,
 
-    dx_ptr,
+    locks_ptr,
 
     N: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     row = tl.program_id(0)
-
-    row_start = row * N
 
     offsets = tl.arange(
         0,
@@ -102,9 +106,11 @@ def _layer_norm_bwd_dx_kernel(
 
     mask = offsets < N
 
-    # -----------------------
+    row_start = row * N
+
+    # ------------------------
     # load
-    # -----------------------
+    # ------------------------
 
     x = tl.load(
         x_ptr + row_start + offsets,
@@ -132,9 +138,9 @@ def _layer_norm_bwd_dx_kernel(
         rstd_ptr + row,
     )
 
-    # -----------------------
-    # x_hat
-    # -----------------------
+    # ------------------------
+    # dx
+    # ------------------------
 
     x_hat = tl.where(
         mask,
@@ -142,19 +148,14 @@ def _layer_norm_bwd_dx_kernel(
         0.0,
     )
 
-    # dL / dx_hat
     g = tl.where(
         mask,
         dy * weight,
         0.0,
     )
 
-    # -----------------------
-    # two reductions
-    # -----------------------
-
     c1 = tl.sum(
-        g * x_hat,
+        x_hat * g,
         axis=0,
     ) / N
 
@@ -162,10 +163,6 @@ def _layer_norm_bwd_dx_kernel(
         g,
         axis=0,
     ) / N
-
-    # -----------------------
-    # dx
-    # -----------------------
 
     dx = rstd * (
         g
@@ -179,13 +176,101 @@ def _layer_norm_bwd_dx_kernel(
         mask=mask,
     )
 
-@triton.jit
-def _layer_norm_bwd_dwdb_kernel(
-    dy_ptr,
-    x_ptr,
+    # ==========================================
+    # partial dw / db
+    # ==========================================
 
-    mean_ptr,
-    rstd_ptr,
+    partial_dw = dy * x_hat
+    partial_db = dy
+
+    # row들을 GROUP_SIZE_M개의 buffer로 분산
+    lock_id = row % GROUP_SIZE_M
+
+    dw_ptrs = (
+        partial_dw_ptr
+        + lock_id * N
+        + offsets
+    )
+
+    db_ptrs = (
+        partial_db_ptr
+        + lock_id * N
+        + offsets
+    )
+
+    # locks:
+    #
+    # [0 : GROUP_SIZE_M]       → mutex
+    # [GROUP_SIZE_M : 2G]      → count
+
+    lock_ptr = (
+        locks_ptr + lock_id
+    )
+
+    count_ptr = (
+        locks_ptr
+        + GROUP_SIZE_M
+        + lock_id
+    )
+
+    # 같은 partial buffer를 사용하는
+    # 다른 program과 race 방지
+    while tl.atomic_cas(
+        lock_ptr,
+        0,
+        1,
+    ) == 1:
+        pass
+
+    count = tl.load(count_ptr)
+
+    if count == 0:
+        # 첫 번째 row
+        tl.atomic_xchg(
+            count_ptr,
+            1,
+        )
+
+    else:
+        old_dw = tl.load(
+            dw_ptrs,
+            mask=mask,
+            other=0.0,
+        )
+
+        old_db = tl.load(
+            db_ptrs,
+            mask=mask,
+            other=0.0,
+        )
+
+        partial_dw += old_dw
+        partial_db += old_db
+
+    tl.store(
+        dw_ptrs,
+        partial_dw,
+        mask=mask,
+    )
+
+    tl.store(
+        db_ptrs,
+        partial_db,
+        mask=mask,
+    )
+
+    tl.debug_barrier()
+
+    # lock release
+    tl.atomic_xchg(
+        lock_ptr,
+        0,
+    )
+
+@triton.jit
+def _layer_norm_bwd_final_dwdb_kernel(
+    partial_dw_ptr,
+    partial_db_ptr,
 
     dw_ptr,
     db_ptr,
@@ -203,34 +288,31 @@ def _layer_norm_bwd_dwdb_kernel(
         + tl.arange(0, BLOCK_N)
     )
 
-    col_mask = cols < N
-
     dw = tl.zeros(
-        (BLOCK_N,),
+        (BLOCK_M, BLOCK_N),
         dtype=tl.float32,
     )
 
     db = tl.zeros(
-        (BLOCK_N,),
+        (BLOCK_M, BLOCK_N),
         dtype=tl.float32,
     )
 
-    # M(row) 방향으로 순회
-    for row_start in range(
+    # 여기서 M은 원래 B*T가 아니라
+    # partial buffer 개수
+    for i in range(
         0,
         M,
         BLOCK_M,
     ):
         rows = (
-            row_start
+            i
             + tl.arange(0, BLOCK_M)
         )
 
-        row_mask = rows < M
-
         mask = (
-            row_mask[:, None]
-            & col_mask[None, :]
+            (rows[:, None] < M)
+            & (cols[None, :] < N)
         )
 
         offsets = (
@@ -238,57 +320,40 @@ def _layer_norm_bwd_dwdb_kernel(
             + cols[None, :]
         )
 
-        x = tl.load(
-            x_ptr + offsets,
+        dw += tl.load(
+            partial_dw_ptr + offsets,
             mask=mask,
             other=0.0,
-        ).to(tl.float32)
+        )
 
-        dy = tl.load(
-            dy_ptr + offsets,
+        db += tl.load(
+            partial_db_ptr + offsets,
             mask=mask,
             other=0.0,
-        ).to(tl.float32)
-
-        mean = tl.load(
-            mean_ptr + rows,
-            mask=row_mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        rstd = tl.load(
-            rstd_ptr + rows,
-            mask=row_mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        x_hat = (
-            x
-            - mean[:, None]
-        ) * rstd[:, None]
-
-        # 같은 column의 모든 row 합
-        dw += tl.sum(
-            dy * x_hat,
-            axis=0,
         )
 
-        db += tl.sum(
-            dy,
-            axis=0,
-        )
+    final_dw = tl.sum(
+        dw,
+        axis=0,
+    )
+
+    final_db = tl.sum(
+        db,
+        axis=0,
+    )
 
     tl.store(
         dw_ptr + cols,
-        dw,
-        mask=col_mask,
+        final_dw,
+        mask=cols < N,
     )
 
     tl.store(
         db_ptr + cols,
-        db,
-        mask=col_mask,
+        final_db,
+        mask=cols < N,
     )
+
 def layer_norm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -414,13 +479,8 @@ class TritonLayerNorm(torch.autograd.Function):
         return y
 
     @staticmethod
-    def backward(
-        ctx,
-        dy,
-    ):
-        x, weight, mean, rstd = (
-            ctx.saved_tensors
-        )
+    def backward(ctx, dy):
+        x, weight, mean, rstd = ctx.saved_tensors
 
         dy = dy.contiguous()
 
@@ -429,36 +489,71 @@ class TritonLayerNorm(torch.autograd.Function):
 
         dx = torch.empty_like(x)
 
-        # -------------------
-        # dx
-        # -------------------
+        dw = torch.empty_like(weight)
+        db = torch.empty_like(weight)
 
-        _layer_norm_bwd_dx_kernel[(M,)](
+        # C=768에서는 256
+        GROUP_SIZE_M = 256
+
+        # M보다 클 필요는 없음
+        GROUP_SIZE_M = min(
+            GROUP_SIZE_M,
+            M,
+        )
+
+        partial_dw = torch.zeros(
+            (GROUP_SIZE_M, N),
+            device=x.device,
+            dtype=torch.float32,
+        )
+
+        partial_db = torch.zeros(
+            (GROUP_SIZE_M, N),
+            device=x.device,
+            dtype=torch.float32,
+        )
+
+        # mutex + count
+        locks = torch.zeros(
+            2 * GROUP_SIZE_M,
+            device=x.device,
+            dtype=torch.int32,
+        )
+
+        # =============================
+        # Stage 1
+        # dx + partial dw/db
+        # =============================
+
+        _layer_norm_bwd_dx_fused_kernel[(M,)](
+            dx,
             dy,
+
+            partial_dw,
+            partial_db,
+
             x,
             weight,
 
             mean,
             rstd,
 
-            dx,
+            locks,
 
             N=N,
+            GROUP_SIZE_M=GROUP_SIZE_M,
             BLOCK_SIZE=ctx.block_size,
 
             num_warps=8,
         )
 
-        # -------------------
-        # dw / db
-        # -------------------
-
-        dw = torch.empty_like(weight)
-
-        db = torch.empty_like(weight)
+        # =============================
+        # Stage 2
+        # partial → final dw/db
+        # =============================
 
         BLOCK_M = 32
-        BLOCK_N = 64
+        BLOCK_N = 128
 
         grid = (
             triton.cdiv(
@@ -467,17 +562,14 @@ class TritonLayerNorm(torch.autograd.Function):
             ),
         )
 
-        _layer_norm_bwd_dwdb_kernel[grid](
-            dy,
-            x,
-
-            mean,
-            rstd,
+        _layer_norm_bwd_final_dwdb_kernel[grid](
+            partial_dw,
+            partial_db,
 
             dw,
             db,
 
-            M,
+            GROUP_SIZE_M,
             N=N,
 
             BLOCK_M=BLOCK_M,
@@ -489,8 +581,6 @@ class TritonLayerNorm(torch.autograd.Function):
         if not ctx.has_bias:
             db = None
 
-        # forward inputs:
-        # x, weight, bias, eps
         return (
             dx,
             dw,
