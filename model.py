@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from triton_kernels.layernorm import layer_norm_autograd
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -26,6 +28,29 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
+class TritonLayerNorm(nn.Module):
+
+    def __init__(self, ndim, bias):
+        super().__init__()
+
+        self.weight = nn.Parameter(
+            torch.ones(ndim)
+        )
+
+        self.bias = (
+            nn.Parameter(torch.zeros(ndim))
+            if bias
+            else None
+        )
+
+    def forward(self, x):
+        return layer_norm_autograd(
+            x,
+            self.weight,
+            self.bias,
+            1e-5,
+        )
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -95,9 +120,14 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        LN = (
+            TritonLayerNorm
+            if config.use_triton_ln
+            else LayerNorm
+        )
+        self.ln_1 = LN(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = LN(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -115,10 +145,17 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
+    use_triton_ln: bool = False
+
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        LN = (
+            TritonLayerNorm
+            if config.use_triton_ln
+            else LayerNorm
+        )
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
@@ -128,7 +165,7 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = LN(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
