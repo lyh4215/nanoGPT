@@ -462,8 +462,8 @@ def triton_flash_attention_forward(
     assert D == 64
     assert T % 64 == 0
 
-    BLOCK_M = 64
-    BLOCK_N = 64
+    BLOCK_M = 32
+    BLOCK_N = 32
 
     scale = 1.0 / math.sqrt(D)
 
