@@ -71,6 +71,79 @@ def triton_softmax(x):
 
     return y
 
+@triton.jit
+def _causal_softmax_kernel(
+    x_ptr,
+    y_ptr,
+    N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    row = tl.program_id(0)
+
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+
+    # row = ((b * H + h) * T + query_idx)
+    query_idx = row % N
+
+    x = tl.load(
+        x_ptr + row * N + offsets,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+
+    # scale
+    x = x * SCALE
+
+    # causal mask
+    causal_mask = offsets <= query_idx
+
+    x = tl.where(
+        causal_mask & mask,
+        x,
+        -float("inf"),
+    )
+
+    # softmax
+    x_max = tl.max(x, axis=0)
+
+    numerator = tl.exp(
+        x - x_max
+    )
+
+    denominator = tl.sum(
+        numerator,
+        axis=0,
+    )
+
+    y = numerator / denominator
+
+    tl.store(
+        y_ptr + row * N + offsets,
+        y,
+        mask=mask,
+    )
+
+def triton_causal_softmax(scores, scale):
+    N = scores.shape[-1]
+    M = scores.numel() // N
+
+    BLOCK_SIZE = triton.next_power_of_2(N)
+
+    out = torch.empty_like(scores)
+
+    _causal_softmax_kernel[(M,)](
+        scores,
+        out,
+        N=N,
+        BLOCK_SIZE=BLOCK_SIZE,
+        SCALE=scale,
+        num_warps=8,
+    )
+
+    return out
+
 def naive_attention(
     q,
     k,
@@ -94,40 +167,10 @@ def naive_attention(
     scores = q @ k.transpose(-2, -1)
     # [B, H, T, T]
 
-    scores = scores / math.sqrt(D)
-
-    # ---------------------------------
-    # 2. causal mask
-    # ---------------------------------
-
-    if causal:
-        mask = torch.tril(
-            torch.ones(
-                T,
-                T,
-                device=q.device,
-                dtype=torch.bool,
-            )
-        )
-
-        scores = scores.masked_fill(
-            ~mask,
-            float("-inf"),
-        )
-
-    # ---------------------------------
-    # 3. row-wise softmax
-    # ---------------------------------
-
-    probs = F.softmax(
+    probs = triton_causal_softmax(
         scores,
-        dim=-1,
+        1.0 / math.sqrt(D),
     )
-    # [B, H, T, T]
-
-    # ---------------------------------
-    # 4. weighted sum of V
-    # ---------------------------------
 
     out = probs @ v
     # [B, H,T,D]
