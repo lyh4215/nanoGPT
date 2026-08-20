@@ -43,7 +43,7 @@ class TritonLayerNorm(nn.Module):
             self.bias,
             1e-5,
         )
-class CausalSelfAttention(nn.Module):
+class TritonCausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -81,7 +81,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-class MLP(nn.Module):
+class TritonMLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -97,30 +97,24 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class Block(nn.Module):
+class TritonBlock(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        LN = (
-            TritonLayerNorm
-        )
-        self.ln_1 = LN(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LN(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.ln_1 = TritonLayerNorm(config.n_embd, bias=config.bias)
+        self.attn = TritonCausalSelfAttention(config)
+        self.ln_2 = TritonLayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = TritonMLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
-class GPT(nn.Module):
+class TritonGPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        LN = (
-            TritonLayerNorm
-        )
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
@@ -129,8 +123,8 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LN(config.n_embd, bias=config.bias),
+            h = nn.ModuleList([TritonBlock(config) for _ in range(config.n_layer)]),
+            ln_f = TritonLayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
