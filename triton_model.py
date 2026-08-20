@@ -18,18 +18,31 @@ from torch.nn import functional as F
 from triton_kernels.layernorm import layer_norm_autograd
 from triton_kernels.attention import triton_flash_attention
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+from model import GPTConfig
+
+
+class TritonLayerNorm(nn.Module):
 
     def __init__(self, ndim, bias):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        self.weight = nn.Parameter(
+            torch.ones(ndim)
+        )
 
+        self.bias = (
+            nn.Parameter(torch.zeros(ndim))
+            if bias
+            else None
+        )
 
+    def forward(self, x):
+        return layer_norm_autograd(
+            x,
+            self.weight,
+            self.bias,
+            1e-5,
+        )
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -47,34 +60,6 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         # 우리가 만든 Triton FlashAttention 사용 여부
 
-        # PyTorch SDPA 지원 여부
-        self.flash = hasattr(
-            torch.nn.functional,
-            "scaled_dot_product_attention",
-        )
-
-        # Triton을 안 쓰고, PyTorch SDPA도 없는 경우에만
-        # slow attention용 causal mask 필요
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. "
-                "Flash Attention requires PyTorch >= 2.0"
-            )
-
-            self.register_buffer(
-                "bias",
-                torch.tril(
-                    torch.ones(
-                        config.block_size,
-                        config.block_size,
-                    )
-                ).view(
-                    1,
-                    1,
-                    config.block_size,
-                    config.block_size,
-                ),
-            )
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
@@ -84,31 +69,12 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0,
-                is_causal=True,
-            )
+        y = triton_flash_attention(
+            q,
+            k,
+            v,
+        )
 
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (
-                1.0 / math.sqrt(k.size(-1))
-            )
-
-            att = att.masked_fill(
-                self.bias[:, :, :T, :T] == 0,
-                float("-inf"),
-            )
-
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-
-            y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
@@ -136,7 +102,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         LN = (
-            LayerNorm
+            TritonLayerNorm
         )
         self.ln_1 = LN(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
@@ -148,22 +114,12 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-
 class GPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         LN = (
-            LayerNorm
+            TritonLayerNorm
         )
         assert config.vocab_size is not None
         assert config.block_size is not None
