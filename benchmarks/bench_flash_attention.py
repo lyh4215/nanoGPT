@@ -19,14 +19,24 @@ dtype = torch.float16
 device = "cuda"
 
 
-q = torch.randn(
-    B, H, T, D,
-    device=device,
-    dtype=dtype,
+C = H * D
+
+qkv = torch.randn(
+    B,
+    T,
+    3 * C,
+    device="cuda",
+    dtype=torch.float16,
 )
 
-k = torch.randn_like(q)
-v = torch.randn_like(q)
+q, k, v = qkv.split(C, dim=2)
+
+q = q.view(B, T, H, D).transpose(1, 2)
+k = k.view(B, T, H, D).transpose(1, 2)
+v = v.view(B, T, H, D).transpose(1, 2)
+
+print(q.stride())
+print(q.is_contiguous())
 
 
 # ==========================================
