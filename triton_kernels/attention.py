@@ -435,8 +435,8 @@ def triton_flash_attention_forward(
     k,
     v,
     block_m=32,
-    block_n=32,
-    num_warps=4,
+    block_n=64,
+    num_warps=1,
 ):
     """
     q, k, v:
