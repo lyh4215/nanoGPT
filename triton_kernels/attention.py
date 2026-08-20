@@ -981,8 +981,10 @@ def _flash_attention_bwd_dkdv_kernel(
     # correctness 우선:
     # 모든 Q tile을 순회
     #
+    start_m_begin = pid_n * BLOCK_N
+
     for start_m in tl.range(
-        0,
+        start_m_begin,
         N_CTX,
         BLOCK_M,
     ):
