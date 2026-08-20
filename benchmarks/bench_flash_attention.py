@@ -92,11 +92,8 @@ def fused_naive_fn():
 # ==========================================
 
 def flash_fn():
-    return triton_flash_attention_forward(
-        q,
-        k,
-        v,
-    )
+    flash, lse = triton_flash_attention_forward(q, k, v)
+    return flash
 
 
 # ==========================================
