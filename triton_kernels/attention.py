@@ -1290,3 +1290,52 @@ def naive_attention(
     # [B, H,T,D]
 
     return out
+
+class TritonFlashAttentionFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, q, k, v):
+        # 우리가 만든 Triton forward
+        out, lse = triton_flash_attention_forward(
+            q,
+            k,
+            v,
+        )
+
+        # backward에서 필요한 tensor 저장
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            out,
+            lse,
+        )
+
+        # 사용자에게는 attention output만 반환
+        return out
+
+    @staticmethod
+    def backward(ctx, do):
+        # forward에서 저장해둔 tensor 복구
+        q, k, v, out, lse = ctx.saved_tensors
+
+        # 우리가 만든 Triton backward
+        dq, dk, dv = triton_flash_attention_backward(
+            q,
+            k,
+            v,
+            out,
+            do,
+            lse,
+        )
+
+        # forward 입력이 q, k, v 세 개였으므로
+        # 각각에 대한 gradient 반환
+        return dq, dk, dv
+
+def triton_flash_attention(q, k, v):
+    return TritonFlashAttentionFunction.apply(
+        q,
+        k,
+        v,
+    )
