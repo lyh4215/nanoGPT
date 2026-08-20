@@ -53,25 +53,37 @@ def main():
     dtype = torch.float16
     device = "cuda"
 
-    q = torch.randn(
-        B, H, T, D,
+    C = H * D
+
+    qkv = torch.randn(
+        B,
+        T,
+        3 * C,
         device=device,
         dtype=dtype,
-        requires_grad=True,
     )
 
-    k = torch.randn(
-        B, H, T, D,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
+    q, k, v = qkv.split(C, dim=2)
+
+    q = (
+        q.view(B, T, H, D)
+        .transpose(1, 2)
+        .detach()
+        .requires_grad_(True)
     )
 
-    v = torch.randn(
-        B, H, T, D,
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
+    k = (
+        k.view(B, T, H, D)
+        .transpose(1, 2)
+        .detach()
+        .requires_grad_(True)
+    )
+
+    v = (
+        v.view(B, T, H, D)
+        .transpose(1, 2)
+        .detach()
+        .requires_grad_(True)
     )
 
     do = torch.randn_like(q)
