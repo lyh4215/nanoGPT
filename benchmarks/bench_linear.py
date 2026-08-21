@@ -465,6 +465,16 @@ def main():
         f"{'F+B x':>9s}"
     )
 
+    print(
+        "dX allclose:",
+        torch.allclose(
+            x_ref.grad,
+            x_tri.grad,
+            atol=1e-2,
+            rtol=1e-2,
+        )
+    )
+
     print("-" * 90)
 
     for r in results:

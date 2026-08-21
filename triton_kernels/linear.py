@@ -209,26 +209,11 @@ def triton_linear_forward(
     x,
     weight,
     bias=None,
+    block_m=32,
+    block_n=32,
+    block_k=32,
+    num_warps=4,
 ):
-    """
-    Equivalent to:
-
-        torch.nn.functional.linear(
-            x,
-            weight,
-            bias,
-        )
-
-    x:
-        [..., K]
-
-    weight:
-        [N, K]
-
-    output:
-        [..., N]
-    """
-
     assert x.is_cuda
     assert weight.is_cuda
 
@@ -238,20 +223,11 @@ def triton_linear_forward(
     K = x.shape[-1]
 
     N, K_weight = weight.shape
-
     assert K == K_weight
 
     original_shape = x.shape
 
-    # [B,T,K]
-    #       ↓
-    # [B*T,K]
-
-    x_2d = x.view(
-        -1,
-        K,
-    )
-
+    x_2d = x.view(-1, K)
     M = x_2d.shape[0]
 
     y = torch.empty(
@@ -260,15 +236,9 @@ def triton_linear_forward(
         dtype=x.dtype,
     )
 
-    # 우선 correctness용.
-    # 튜닝은 나중.
-    BLOCK_M = 32
-    BLOCK_N = 32
-    BLOCK_K = 32
-
     grid = (
-        triton.cdiv(M, BLOCK_M),
-        triton.cdiv(N, BLOCK_N),
+        triton.cdiv(M, block_m),
+        triton.cdiv(N, block_n),
     )
 
     _linear_fwd_kernel[grid](
@@ -292,11 +262,11 @@ def triton_linear_forward(
 
         HAS_BIAS=bias is not None,
 
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
 
-        num_warps=4,
+        num_warps=num_warps,
     )
 
     return y.view(
