@@ -131,9 +131,37 @@ def _linear_fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    # 한 group은 M 방향 GROUP_SIZE_M개와
+    # 모든 N tile로 구성
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    group_id = pid // num_pid_in_group
+
+    first_pid_m = group_id * GROUP_SIZE_M
+
+    # 마지막 group은 GROUP_SIZE_M보다 작을 수 있음
+    group_size_m = min(
+        num_pid_m - first_pid_m,
+        GROUP_SIZE_M,
+    )
+
+    # group 내부에서는 먼저 M을 바꾼다.
+    pid_m = (
+        first_pid_m
+        + (pid % num_pid_in_group) % group_size_m
+    )
+
+    pid_n = (
+        (pid % num_pid_in_group)
+        // group_size_m
+    )
 
     offs_m = (
         pid_m * BLOCK_M
@@ -209,10 +237,11 @@ def triton_linear_forward(
     x,
     weight,
     bias=None,
-    block_m=32,
-    block_n=32,
+    block_m=128,
+    block_n=128,
     block_k=32,
     num_warps=4,
+    group_size_m=1,
 ):
     assert x.is_cuda
     assert weight.is_cuda
@@ -237,8 +266,8 @@ def triton_linear_forward(
     )
 
     grid = (
-        triton.cdiv(M, block_m),
-        triton.cdiv(N, block_n),
+        triton.cdiv(M, block_m)
+        * triton.cdiv(N, block_n),
     )
 
     _linear_fwd_kernel[grid](
@@ -265,6 +294,7 @@ def triton_linear_forward(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
+        GROUP_SIZE_M=group_size_m,
 
         num_warps=num_warps,
     )
