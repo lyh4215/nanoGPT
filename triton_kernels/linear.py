@@ -4,34 +4,50 @@ import triton.language as tl
 
 from triton_kernels.matmul import _matmul_accumulate
 
-def get_linear_config(K, N):
-    BLOCK_M = 128
-    BLOCK_N = 128
-    BLOCK_K = 32
-    num_warps = 4
-
+def _get_linear_fwd_config(K, N):
     if K == 768 and N == 2304:
-        group_size_m = 8       # QKV
+        return 128, 128, 32, 4, 8
 
-    elif K == 768 and N == 768:
-        group_size_m = 1       # attn proj
+    if K == 768 and N == 768:
+        return 128, 128, 32, 4, 1
 
-    elif K == 768 and N == 3072:
-        group_size_m = 4       # MLP fc
+    if K == 768 and N == 3072:
+        return 128, 128, 32, 4, 4
 
-    elif K == 3072 and N == 768:
-        group_size_m = 2       # MLP proj
+    if K == 3072 and N == 768:
+        return 128, 128, 32, 4, 2
 
-    else:
-        group_size_m = 8
+    return 128, 128, 32, 4, 1
 
-    return (
-        BLOCK_M,
-        BLOCK_N,
-        BLOCK_K,
-        num_warps,
-        group_size_m,
-    )
+def _get_linear_dx_config(K, N):
+    if K == 768 and N == 2304:
+        return 128, 128, 32, 4, 1
+
+    if K == 768 and N == 768:
+        return 128, 128, 32, 4, 4
+
+    if K == 768 and N == 3072:
+        return 128, 128, 64, 4, 2
+
+    if K == 3072 and N == 768:
+        return 128, 128, 32, 4, 4
+
+    return 128, 128, 32, 4, 1
+
+def _get_linear_dw_config(K, N):
+    if K == 768 and N == 2304:
+        return 128, 128, 64, 4, 1
+
+    if K == 768 and N == 768:
+        return 64, 128, 32, 4, 1
+
+    if K == 768 and N == 3072:
+        return 128, 128, 32, 4, 1
+
+    if K == 3072 and N == 768:
+        return 128, 128, 32, 4, 16
+
+    return 128, 128, 32, 4, 1
 
 @triton.jit
 def _linear_tile_from_ptrs(
@@ -282,6 +298,14 @@ def triton_linear_forward(
 
     N, K_weight = weight.shape
     assert K == K_weight
+
+    (
+        block_m,
+        block_n,
+        block_k,
+        num_warps,
+        group_size_m,
+    ) = _get_linear_fwd_config(K, N)
 
     original_shape = x.shape
 
@@ -742,6 +766,14 @@ def triton_linear_backward_dx(
 
     assert N == N_weight
 
+    (
+        block_m,
+        block_k,
+        block_n,
+        num_warps,
+        group_size_m,
+    ) = _get_linear_dx_config(K, N)
+
     original_shape = dy.shape
 
     dy_2d = dy.reshape(
@@ -811,6 +843,14 @@ def triton_linear_backward_dw(
 
     N = dy.shape[-1]
     K = x.shape[-1]
+
+    (
+        block_n,
+        block_k,
+        block_m,
+        num_warps,
+        group_size_n,
+    ) = _get_linear_dw_config(K, N)
 
     dy_2d = dy.reshape(
         -1,
