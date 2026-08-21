@@ -2,39 +2,31 @@ import torch
 import triton
 
 from model import (
-    CausalSelfAttention as TorchAttention,
+    CausalSelfAttention,
     GPTConfig,
 )
 
 from triton_model import (
-    TritonCausalSelfAttention as TritonAttention,
+    TritonCausalSelfAttention,
 )
 
 
 DEVICE = "cuda"
 DTYPE = torch.float16
 
-
-def print_diff(
-    name,
-    a,
-    b,
-):
-    diff = (
-        a.float()
-        - b.float()
-    ).abs()
-
-    print(
-        f"{name:>12} | "
-        f"max={diff.max().item():.6e} | "
-        f"mean={diff.mean().item():.6e}"
-    )
+B = 8
+T = 1024
 
 
 def main():
-
     torch.manual_seed(0)
+
+    # CUDA context 미리 생성
+    torch.cuda.init()
+
+    # ============================================================
+    # Config
+    # ============================================================
 
     config = GPTConfig(
         block_size=1024,
@@ -48,25 +40,27 @@ def main():
         bias=True,
     )
 
-    # ========================================================
+    C = config.n_embd
+
+    # ============================================================
     # Modules
-    # ========================================================
+    # ============================================================
 
-    ref = TorchAttention(
+    ref = CausalSelfAttention(
         config
     ).to(
         device=DEVICE,
         dtype=DTYPE,
     )
 
-    tri = TritonAttention(
+    tri = TritonCausalSelfAttention(
         config
     ).to(
         device=DEVICE,
         dtype=DTYPE,
     )
 
-    # 정확히 같은 parameter
+    # 동일한 weight 사용
     tri.load_state_dict(
         ref.state_dict()
     )
@@ -74,20 +68,23 @@ def main():
     ref.train()
     tri.train()
 
-    # ========================================================
+    # ============================================================
     # Input
-    # ========================================================
+    # ============================================================
 
-    B = 2
-    T = 128
-    C = config.n_embd
-
-    x = torch.randn(
+    x_ref = torch.randn(
         B,
         T,
         C,
         device=DEVICE,
         dtype=DTYPE,
+        requires_grad=True,
+    )
+
+    x_tri = (
+        x_ref.detach()
+        .clone()
+        .requires_grad_(True)
     )
 
     dy = torch.randn(
@@ -98,101 +95,153 @@ def main():
         dtype=DTYPE,
     )
 
-    # ========================================================
-    # Reference
-    # ========================================================
+    # ============================================================
+    # Forward closures
+    # ============================================================
 
-    x_ref = (
-        x.detach()
-        .clone()
-        .requires_grad_(True)
-    )
+    def torch_forward():
+        return ref(
+            x_ref
+        )
+
+    def triton_forward():
+        return tri(
+            x_tri
+        )
+
+    # ============================================================
+    # Forward + Backward closures
+    # ============================================================
+
+    def torch_fb():
+        x_ref.grad = None
+
+        ref.zero_grad(
+            set_to_none=True
+        )
+
+        y = ref(
+            x_ref
+        )
+
+        y.backward(
+            dy
+        )
+
+    def triton_fb():
+        x_tri.grad = None
+
+        tri.zero_grad(
+            set_to_none=True
+        )
+
+        y = tri(
+            x_tri
+        )
+
+        y.backward(
+            dy
+        )
+
+    # ============================================================
+    # Warmup / Triton compile
+    # ============================================================
+
+    for _ in range(3):
+        torch_forward()
+        triton_forward()
+
+    torch.cuda.synchronize()
+
+    torch_fb()
+    triton_fb()
+
+    torch.cuda.synchronize()
+
+    # grad cleanup
+    x_ref.grad = None
+    x_tri.grad = None
 
     ref.zero_grad(
         set_to_none=True
-    )
-
-    y_ref = ref(
-        x_ref
-    )
-
-    y_ref.backward(
-        dy
-    )
-
-    # ========================================================
-    # Triton
-    # ========================================================
-
-    x_tri = (
-        x.detach()
-        .clone()
-        .requires_grad_(True)
     )
 
     tri.zero_grad(
         set_to_none=True
     )
 
-    y_tri = tri(
-        x_tri
+    # ============================================================
+    # Forward benchmark
+    # ============================================================
+
+    torch_fwd_ms = triton.testing.do_bench(
+        torch_forward,
     )
 
-    y_tri.backward(
-        dy
+    triton_fwd_ms = triton.testing.do_bench(
+        triton_forward,
     )
 
-    # ========================================================
-    # Correctness
-    # ========================================================
+    # ============================================================
+    # Forward + Backward benchmark
+    # ============================================================
+
+    torch_fb_ms = triton.testing.do_bench(
+        torch_fb,
+    )
+
+    triton_fb_ms = triton.testing.do_bench(
+        triton_fb,
+    )
+
+    # ============================================================
+    # Results
+    # ============================================================
 
     print()
     print("=" * 80)
-    print("Attention module correctness")
+    print(
+        f"Attention Module Benchmark "
+        f"B={B}, T={T}, C={C}"
+    )
     print("=" * 80)
 
-    print_diff(
-        "output",
-        y_ref,
-        y_tri,
+    print()
+    print("[Forward]")
+
+    print(
+        f"PyTorch : "
+        f"{torch_fwd_ms:.4f} ms"
     )
 
-    print_diff(
-        "dx",
-        x_ref.grad,
-        x_tri.grad,
+    print(
+        f"Triton  : "
+        f"{triton_fwd_ms:.4f} ms"
     )
 
-    # ========================================================
-    # Parameter gradients
-    # ========================================================
-
-    ref_params = dict(
-        ref.named_parameters()
-    )
-
-    tri_params = dict(
-        tri.named_parameters()
+    print(
+        f"Speedup : "
+        f"{torch_fwd_ms / triton_fwd_ms:.2f}x"
     )
 
     print()
-    print("[Parameter gradients]")
 
-    for name in ref_params:
+    print("[Forward + Backward]")
 
-        grad_ref = (
-            ref_params[name].grad
-        )
+    print(
+        f"PyTorch : "
+        f"{torch_fb_ms:.4f} ms"
+    )
 
-        grad_tri = (
-            tri_params[name].grad
-        )
+    print(
+        f"Triton  : "
+        f"{triton_fb_ms:.4f} ms"
+    )
 
-        print_diff(
-            name,
-            grad_ref,
-            grad_tri,
-        )
+    print(
+        f"Speedup : "
+        f"{torch_fb_ms / triton_fb_ms:.2f}x"
+    )
 
 
 if __name__ == "__main__":
