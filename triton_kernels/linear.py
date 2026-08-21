@@ -4,6 +4,35 @@ import triton.language as tl
 
 from triton_kernels.matmul import _matmul_accumulate
 
+def get_linear_config(K, N):
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 32
+    num_warps = 4
+
+    if K == 768 and N == 2304:
+        group_size_m = 8       # QKV
+
+    elif K == 768 and N == 768:
+        group_size_m = 1       # attn proj
+
+    elif K == 768 and N == 3072:
+        group_size_m = 4       # MLP fc
+
+    elif K == 3072 and N == 768:
+        group_size_m = 2       # MLP proj
+
+    else:
+        group_size_m = 8
+
+    return (
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        num_warps,
+        group_size_m,
+    )
+
 @triton.jit
 def _linear_tile_from_ptrs(
     X,
@@ -241,7 +270,7 @@ def triton_linear_forward(
     block_n=128,
     block_k=32,
     num_warps=4,
-    group_size_m=1,
+    group_size_m=8,
 ):
     assert x.is_cuda
     assert weight.is_cuda
@@ -326,9 +355,67 @@ def _linear_bwd_dx_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
+
+    GROUP_SIZE_M: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_k = tl.program_id(1)
+    # ========================================================
+    # 1D program id -> grouped (pid_m, pid_k)
+    #
+    # output = dX [M, K]
+    # ========================================================
+
+    pid = tl.program_id(0)
+
+    num_pid_m = tl.cdiv(
+        M,
+        BLOCK_M,
+    )
+
+    num_pid_k = tl.cdiv(
+        K,
+        BLOCK_K,
+    )
+
+    num_pid_in_group = (
+        GROUP_SIZE_M
+        * num_pid_k
+    )
+
+    group_id = (
+        pid
+        // num_pid_in_group
+    )
+
+    first_pid_m = (
+        group_id
+        * GROUP_SIZE_M
+    )
+
+    group_size_m = min(
+        num_pid_m - first_pid_m,
+        GROUP_SIZE_M,
+    )
+
+    pid_m = (
+        first_pid_m
+        + (
+            pid
+            % num_pid_in_group
+        )
+        % group_size_m
+    )
+
+    pid_k = (
+        (
+            pid
+            % num_pid_in_group
+        )
+        // group_size_m
+    )
+
+    # ========================================================
+    # Output offsets
+    # ========================================================
 
     offs_m = (
         pid_m * BLOCK_M
@@ -340,23 +427,23 @@ def _linear_bwd_dx_kernel(
         + tl.arange(0, BLOCK_K)
     )
 
+    # reduction dimension
     offs_n = tl.arange(
         0,
         BLOCK_N,
     )
 
     # dX tile
-    #
-    # [BM, BK]
+    # [BLOCK_M, BLOCK_K]
     acc = tl.zeros(
         (BLOCK_M, BLOCK_K),
         dtype=tl.float32,
     )
 
     # ========================================================
-    # reduction over N
-    #
     # dX = dY @ W
+    #
+    # [BM, N] @ [N, BK]
     # ========================================================
 
     for n_start in range(
@@ -372,7 +459,7 @@ def _linear_bwd_dx_kernel(
         # ----------------------------------------------------
         # dY tile
         #
-        # [BM, BN]
+        # [BLOCK_M, BLOCK_N]
         # ----------------------------------------------------
 
         dy_ptrs = (
@@ -393,19 +480,18 @@ def _linear_bwd_dx_kernel(
         # ----------------------------------------------------
         # W tile
         #
-        # 원래 W:
+        # 실제 W shape = [N, K]
         #
-        # [N, K]
-        #
-        # 그런데 helper가
-        #
-        # a @ b.T
-        #
-        # 를 하므로 여기서는:
-        #
-        # [BK, BN]
+        # register에서는 일부러:
+        # [BLOCK_K, BLOCK_N]
         #
         # 형태로 읽는다.
+        #
+        # helper 내부:
+        # tl.dot(dy, tl.trans(w))
+        #
+        # [BM,BN] @ [BN,BK]
+        # -> [BM,BK]
         # ----------------------------------------------------
 
         w_ptrs = (
@@ -423,17 +509,6 @@ def _linear_bwd_dx_kernel(
             other=0.0,
         )
 
-        # dy : [BM, BN]
-        # w  : [BK, BN]
-        #
-        # helper:
-        #
-        # dy @ w.T
-        #
-        # [BM,BN] @ [BN,BK]
-        #        ↓
-        # [BM,BK]
-
         acc = _matmul_accumulate(
             acc,
             dy,
@@ -441,7 +516,7 @@ def _linear_bwd_dx_kernel(
         )
 
     # ========================================================
-    # store dX
+    # Store dX
     # ========================================================
 
     dx_ptrs = (
@@ -613,12 +688,16 @@ def _linear_bwd_dw_kernel(
 def triton_linear_backward_dx(
     dy,
     weight,
+
+    block_m=32,
+    block_k=32,
+    block_n=32,
+
+    num_warps=4,
+    group_size_m=1,
 ):
     assert dy.is_cuda
     assert weight.is_cuda
-
-    # dy : [..., N]
-    # W  : [N, K]
 
     N = dy.shape[-1]
 
@@ -641,13 +720,10 @@ def triton_linear_backward_dx(
         dtype=dy.dtype,
     )
 
-    BLOCK_M = 32
-    BLOCK_K = 32
-    BLOCK_N = 32
-
+    # output grid = [M, K]
     grid = (
-        triton.cdiv(M, BLOCK_M),
-        triton.cdiv(K, BLOCK_K),
+        triton.cdiv(M, block_m)
+        * triton.cdiv(K, block_k),
     )
 
     _linear_bwd_dx_kernel[grid](
@@ -668,11 +744,13 @@ def triton_linear_backward_dx(
         stride_dxm=dx.stride(0),
         stride_dxk=dx.stride(1),
 
-        BLOCK_M=BLOCK_M,
-        BLOCK_K=BLOCK_K,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=block_m,
+        BLOCK_K=block_k,
+        BLOCK_N=block_n,
 
-        num_warps=4,
+        GROUP_SIZE_M=group_size_m,
+
+        num_warps=num_warps,
     )
 
     return dx.view(
