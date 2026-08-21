@@ -498,15 +498,7 @@ def main():
                     rtol=1e-2,
                 )
 
-                if not ok:
-                    print(
-                        f"{group_size:10d}"
-                        f"{'FAIL':>15}"
-                        f"{'':>12}"
-                        f"{max_diff:15.6e}"
-                    )
-
-                    continue
+                status = "OK" if ok else "NUM"
 
                 ms = bench_dw(
                     dy,
