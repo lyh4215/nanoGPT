@@ -6,7 +6,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-
 @triton.jit
 def _softmax_kernel(
     x_ptr,
@@ -143,12 +142,6 @@ def triton_causal_softmax(scores, scale):
     )
 
     return out
-
-import math
-
-import torch
-import triton
-import triton.language as tl
 
 
 @triton.jit
