@@ -17,6 +17,7 @@ from torch.nn import functional as F
 
 from triton_kernels.layernorm import layer_norm_autograd
 from triton_kernels.attention import triton_flash_attention
+from triton_kernels.linear import triton_linear
 
 from model import GPTConfig
 
@@ -47,27 +48,123 @@ class TritonCausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
+
+        # ====================================================
+        # Parameters
+        #
+        # storage 자체는 nn.Linear 그대로 둔다.
+        # → reference model.py와 state_dict 호환
+        # ====================================================
+
+        self.c_attn = nn.Linear(
+            config.n_embd,
+            3 * config.n_embd,
+            bias=config.bias,
+        )
+
+        self.c_proj = nn.Linear(
+            config.n_embd,
+            config.n_embd,
+            bias=config.bias,
+        )
+
+        self.resid_dropout = nn.Dropout(
+            config.dropout
+        )
+
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # 우리가 만든 Triton FlashAttention 사용 여부
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        B, T, C = x.size()
+
+        # ====================================================
+        # 1. QKV projection
+        #
+        # PyTorch:
+        #
+        # q, k, v = self.c_attn(x).split(C, dim=2)
+        #
+        # ↓
+        #
+        # Triton Linear
+        # ====================================================
+
+        qkv = triton_linear(
+            x,
+            self.c_attn.weight,
+            self.c_attn.bias,
+        )
+
+        q, k, v = qkv.split(
+            C,
+            dim=2,
+        )
+
+        # ====================================================
+        # 2. [B,T,C] -> [B,H,T,D]
+        # ====================================================
+
+        head_dim = (
+            C // self.n_head
+        )
+
+        q = (
+            q
+            .view(
+                B,
+                T,
+                self.n_head,
+                head_dim,
+            )
+            .transpose(1, 2)
+        )
+
+        k = (
+            k
+            .view(
+                B,
+                T,
+                self.n_head,
+                head_dim,
+            )
+            .transpose(1, 2)
+        )
+
+        v = (
+            v
+            .view(
+                B,
+                T,
+                self.n_head,
+                head_dim,
+            )
+            .transpose(1, 2)
+        )
+
+        # ====================================================
+        # 3. FlashAttention
+        #
+        # q,k,v:
+        # [B,H,T,D]
+        #
+        # output:
+        # [B,H,T,D]
+        # ====================================================
+
+        # 현재 Triton FlashAttention에는
+        # attention dropout이 구현되어 있지 않음.
+        #
+        # correctness 비교는 dropout=0.0에서 하자.
+        if self.training and self.dropout != 0.0:
+            raise NotImplementedError(
+                "Triton FlashAttention currently "
+                "does not support attention dropout"
+            )
 
         y = triton_flash_attention(
             q,
@@ -75,10 +172,47 @@ class TritonCausalSelfAttention(nn.Module):
             v,
         )
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # ====================================================
+        # 4. [B,H,T,D] -> [B,T,C]
+        # ====================================================
 
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        y = (
+            y
+            .transpose(1, 2)
+            .contiguous()
+            .view(
+                B,
+                T,
+                C,
+            )
+        )
+
+        # 여기 contiguous()가 중요.
+        #
+        # transpose 이후:
+        # [B,T,H,D]는 strided view이고
+        #
+        # 현재 triton_linear_forward는
+        # x.is_contiguous()를 요구함.
+
+        # ====================================================
+        # 5. Output projection
+        # ====================================================
+
+        y = triton_linear(
+            y,
+            self.c_proj.weight,
+            self.c_proj.bias,
+        )
+
+        # ====================================================
+        # 6. residual dropout
+        #
+        # 이건 일단 PyTorch 그대로.
+        # ====================================================
+
+        y = self.resid_dropout(y)
+
         return y
 
 class TritonMLP(nn.Module):
