@@ -962,3 +962,15 @@ class TritonLinearFunction(torch.autograd.Function):
             dw,
             db,
         )
+
+
+def triton_linear(
+    x,
+    weight,
+    bias=None,
+):
+    return TritonLinearFunction.apply(
+        x,
+        weight,
+        bias,
+    )
