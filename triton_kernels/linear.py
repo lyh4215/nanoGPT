@@ -556,9 +556,46 @@ def _linear_bwd_dw_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    GROUP_SIZE_N: tl.constexpr,
 ):
-    pid_n = tl.program_id(0)
-    pid_k = tl.program_id(1)
+    pid = tl.program_id(0)
+
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_k = tl.cdiv(K, BLOCK_K)
+
+    num_pid_in_group = (
+        GROUP_SIZE_N
+        * num_pid_k
+    )
+
+    group_id = (
+        pid
+        // num_pid_in_group
+    )
+
+    first_pid_n = (
+        group_id
+        * GROUP_SIZE_N
+    )
+
+    group_size_n = min(
+        num_pid_n - first_pid_n,
+        GROUP_SIZE_N,
+    )
+
+    pid_n = (
+        first_pid_n
+        + (
+            pid % num_pid_in_group
+        ) % group_size_n
+    )
+
+    pid_k = (
+        (
+            pid % num_pid_in_group
+        )
+        // group_size_n
+    )
 
     offs_n = (
         pid_n * BLOCK_N
@@ -689,12 +726,12 @@ def triton_linear_backward_dx(
     dy,
     weight,
 
-    block_m=32,
-    block_k=32,
+    block_m=128,
+    block_k=128,
     block_n=32,
 
     num_warps=4,
-    group_size_m=1,
+    group_size_m=4,
 ):
     assert dy.is_cuda
     assert weight.is_cuda
@@ -761,12 +798,16 @@ def triton_linear_backward_dx(
 def triton_linear_backward_dw(
     dy,
     x,
+
+    block_n=32,
+    block_k=32,
+    block_m=32,
+
+    num_warps=4,
+    group_size_n=1,
 ):
     assert dy.is_cuda
     assert x.is_cuda
-
-    # dy : [..., N]
-    # x  : [..., K]
 
     N = dy.shape[-1]
     K = x.shape[-1]
@@ -791,13 +832,9 @@ def triton_linear_backward_dw(
         dtype=dy.dtype,
     )
 
-    BLOCK_N = 32
-    BLOCK_K = 32
-    BLOCK_M = 32
-
     grid = (
-        triton.cdiv(N, BLOCK_N),
-        triton.cdiv(K, BLOCK_K),
+        triton.cdiv(N, block_n)
+        * triton.cdiv(K, block_k),
     )
 
     _linear_bwd_dw_kernel[grid](
@@ -818,11 +855,13 @@ def triton_linear_backward_dw(
         stride_dwn=dw.stride(0),
         stride_dwk=dw.stride(1),
 
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        BLOCK_M=BLOCK_M,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        BLOCK_M=block_m,
 
-        num_warps=4,
+        GROUP_SIZE_N=group_size_n,
+
+        num_warps=num_warps,
     )
 
     return dw
