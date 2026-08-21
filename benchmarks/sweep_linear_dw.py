@@ -268,18 +268,7 @@ def main():
                     rtol=1e-2,
                 )
 
-                if not ok:
-                    print(
-                        f"{bn:5d}"
-                        f"{bk:5d}"
-                        f"{bm:5d}"
-                        f"{warps:4d}"
-                        f"{'FAIL':>12}"
-                        f"{'':>12}"
-                        f"{max_diff:15.6e}"
-                    )
-
-                    continue
+                status = "OK" if ok else "NUM"
 
                 # --------------------------------------------
                 # benchmark
