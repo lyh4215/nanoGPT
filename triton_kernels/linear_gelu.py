@@ -298,6 +298,9 @@ def triton_linear_gelu_forward(
 
 @triton.jit
 def _gelu_backward(dy, z):
+    dy = dy.to(tl.float32)
+    z = z.to(tl.float32)
+
     cdf = 0.5 * (
         1.0
         + tl.erf(
