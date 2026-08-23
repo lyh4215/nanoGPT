@@ -1,77 +1,114 @@
+import pytest
 import torch
 import torch.nn.functional as F
 
-from triton_kernels.linear_gelu import linear_gelu
+from triton_kernels.linear_gelu import (
+    triton_linear_gelu_forward,
+)
 
 
-def test_linear_gelu():
+DEVICE = "cuda"
+DTYPE = torch.float16
+
+
+@pytest.mark.parametrize(
+    "use_bias",
+    [True, False],
+)
+def test_triton_linear_gelu_forward(use_bias):
     torch.manual_seed(0)
 
+    # GPT-2 MLP c_fc 실제 shape
     B = 2
     T = 128
 
-    C = 768
-    N = 4 * C
+    K = 768
+    N = 3072
+
+    # ========================================================
+    # Input
+    # ========================================================
 
     x = torch.randn(
         B,
         T,
-        C,
-        device="cuda",
-        dtype=torch.float16,
+        K,
+        device=DEVICE,
+        dtype=DTYPE,
     )
 
     weight = torch.randn(
         N,
-        C,
-        device="cuda",
-        dtype=torch.float16,
+        K,
+        device=DEVICE,
+        dtype=DTYPE,
     )
 
-    bias = torch.randn(
-        N,
-        device="cuda",
-        dtype=torch.float16,
-    )
+    if use_bias:
+        bias = torch.randn(
+            N,
+            device=DEVICE,
+            dtype=DTYPE,
+        )
+    else:
+        bias = None
 
+    # ========================================================
     # PyTorch reference
-    y_torch = F.linear(
-        x,
-        weight,
-        bias,
+    #
+    # Linear
+    #   ↓
+    # GELU
+    # ========================================================
+
+    ref = F.gelu(
+        F.linear(
+            x,
+            weight,
+            bias,
+        )
     )
 
-    y_torch = F.gelu(
-        y_torch,
-        approximate="none",
-    )
-
+    # ========================================================
     # Triton fused
-    y_triton = linear_gelu(
+    #
+    # Linear + GELU
+    # ========================================================
+
+    out = triton_linear_gelu_forward(
         x,
         weight,
         bias,
     )
 
-    print("shape:", y_triton.shape)
+    # ========================================================
+    # Basic checks
+    # ========================================================
 
-    print(
-        "max error:",
-        (y_torch - y_triton)
-        .abs()
-        .max()
-        .item()
-    )
+    assert out.shape == ref.shape
+    assert out.dtype == ref.dtype
+    assert out.device == ref.device
 
-    torch.testing.assert_close(
-        y_triton,
-        y_torch,
-        rtol=1e-2,
+    # ========================================================
+    # Numerical correctness
+    # ========================================================
+
+    diff = (
+        out.float()
+        - ref.float()
+    ).abs()
+
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+
+    assert torch.allclose(
+        out,
+        ref,
         atol=1e-2,
+        rtol=1e-2,
+    ), (
+        f"Linear+GELU mismatch\n"
+        f"use_bias={use_bias}\n"
+        f"max_diff={max_diff:.6e}\n"
+        f"mean_diff={mean_diff:.6e}"
     )
-
-    print("Linear + GELU correctness: PASS")
-
-
-if __name__ == "__main__":
-    test_linear_gelu()
