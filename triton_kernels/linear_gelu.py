@@ -10,6 +10,13 @@ from triton_kernels.linear import (
     triton_linear_backward_db,
 )
 
+def _get_linear_gelu_fwd_config(K, N):
+    # GPT-2 MLP c_fc
+    if K == 768 and N == 3072:
+        return 128, 64, 64, 4, 8
+
+    return 128, 64, 64, 4, 1
+
 @triton.jit
 def _gelu(x):
     return 0.5 * x * (
@@ -247,7 +254,7 @@ def triton_linear_gelu_forward(
         block_k,
         num_warps,
         group_size_m,
-    ) = _get_linear_fwd_config(
+    ) = _get_linear_gelu_fwd_config(
         K,
         N,
     )
