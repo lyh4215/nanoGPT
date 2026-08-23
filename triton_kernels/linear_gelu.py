@@ -5,6 +5,9 @@ import triton.language as tl
 from triton_kernels.linear import (
     _linear_tile_from_ptrs,
     _get_linear_fwd_config,
+    triton_linear_backward_dx,
+    triton_linear_backward_dw,
+    triton_linear_backward_db,
 )
 
 @triton.jit
@@ -21,6 +24,7 @@ def _linear_gelu_fwd_kernel(
     X,
     W,
     BIAS,
+    Z,
     Y,
 
     M: tl.constexpr,
@@ -32,6 +36,9 @@ def _linear_gelu_fwd_kernel(
 
     stride_wn,
     stride_wk,
+
+    stride_zm,
+    stride_zn,
 
     stride_ym,
     stride_yn,
@@ -128,6 +135,9 @@ def _linear_gelu_fwd_kernel(
         stride_wn,
         stride_wk,
 
+        stride_zm,
+        stride_zn,
+
         BLOCK_M,
         BLOCK_N,
         BLOCK_K,
@@ -145,6 +155,26 @@ def _linear_gelu_fwd_kernel(
         )
 
         acc += bias[None, :]
+    # ------------------------------------------------------------
+    # Z = Linear output
+    # backward에서 GELU'(Z)를 계산하기 위해 저장
+    # ------------------------------------------------------------
+    z_ptrs = (
+        Z
+        + offs_m[:, None] * stride_zm
+        + offs_n[None, :] * stride_zn
+    )
+
+    mask = (
+        (offs_m[:, None] < M)
+        & (offs_n[None, :] < N)
+    )
+
+    tl.store(
+        z_ptrs,
+        acc,
+        mask=mask,
+    )
 
     # ========================================================
     # GELU
@@ -201,6 +231,12 @@ def triton_linear_gelu_forward(
 
     M = x_2d.shape[0]
 
+    z = torch.empty(
+        (M, N),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
     y = torch.empty(
         (M, N),
         device=x.device,
@@ -227,6 +263,7 @@ def triton_linear_gelu_forward(
         x_2d,
         weight,
         bias,
+        z,
         y,
 
         M=M,
@@ -238,6 +275,9 @@ def triton_linear_gelu_forward(
 
         stride_wn=weight.stride(0),
         stride_wk=weight.stride(1),
+
+        stride_zm=z.stride(0),
+        stride_zn=z.stride(1),
 
         stride_ym=y.stride(0),
         stride_yn=y.stride(1),
@@ -253,7 +293,194 @@ def triton_linear_gelu_forward(
         num_warps=num_warps,
     )
 
-    return y.view(
-        *original_shape[:-1],
-        N,
+    return (
+        y.view(*original_shape[:-1], N),
+        z.view(*original_shape[:-1], N),
+    )
+
+@triton.jit
+def _gelu_backward(dy, z):
+    cdf = 0.5 * (
+        1.0
+        + tl.erf(
+            z * 0.7071067811865476
+        )
+    )
+
+    pdf_term = (
+        z
+        * 0.3989422804014327
+        * tl.exp(-0.5 * z * z)
+    )
+
+    return dy * (
+        cdf + pdf_term
+    )
+
+@triton.jit
+def _gelu_bwd_kernel(
+    DY,
+    Z,
+    DZ,
+
+    N_ELEMENTS: tl.constexpr,
+
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    offsets = (
+        pid * BLOCK_SIZE
+        + tl.arange(0, BLOCK_SIZE)
+    )
+
+    mask = offsets < N_ELEMENTS
+
+    dy = tl.load(
+        DY + offsets,
+        mask=mask,
+        other=0.0,
+    )
+
+    z = tl.load(
+        Z + offsets,
+        mask=mask,
+        other=0.0,
+    )
+
+    dz = _gelu_backward(
+        dy,
+        z,
+    )
+
+    tl.store(
+        DZ + offsets,
+        dz,
+        mask=mask,
+    )
+
+def triton_gelu_backward(
+    dy,
+    z,
+):
+    assert dy.is_cuda
+    assert z.is_cuda
+    assert dy.shape == z.shape
+
+    dy_flat = dy.contiguous().view(-1)
+    z_flat = z.contiguous().view(-1)
+
+    dz = torch.empty_like(
+        dy_flat
+    )
+
+    n_elements = dy_flat.numel()
+
+    BLOCK_SIZE = 256
+
+    grid = (
+        triton.cdiv(
+            n_elements,
+            BLOCK_SIZE,
+        ),
+    )
+
+    _gelu_bwd_kernel[grid](
+        dy_flat,
+        z_flat,
+        dz,
+
+        N_ELEMENTS=n_elements,
+
+        BLOCK_SIZE=BLOCK_SIZE,
+
+        num_warps=4,
+    )
+
+    return dz.view_as(dy)
+
+class TritonLinearGELUFunction(
+    torch.autograd.Function
+):
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        weight,
+        bias=None,
+    ):
+        y, z = triton_linear_gelu_forward(
+            x,
+            weight,
+            bias,
+        )
+
+        ctx.save_for_backward(
+            x,
+            weight,
+            z,
+        )
+
+        ctx.has_bias = (
+            bias is not None
+        )
+
+        return y
+
+    @staticmethod
+    def backward(
+        ctx,
+        dy,
+    ):
+        x, weight, z = (
+            ctx.saved_tensors
+        )
+
+        # ====================================================
+        # GELU backward
+        # ====================================================
+
+        dz = triton_gelu_backward(
+            dy,
+            z,
+        )
+
+        # ====================================================
+        # Linear backward
+        # ====================================================
+
+        dx = triton_linear_backward_dx(
+            dz,
+            weight,
+        )
+
+        dw = triton_linear_backward_dw(
+            dz,
+            x,
+        )
+
+        db = (
+            triton_linear_backward_db(
+                dz
+            )
+            if ctx.has_bias
+            else None
+        )
+
+        return (
+            dx,
+            dw,
+            db,
+        )
+
+def triton_linear_gelu(
+    x,
+    weight,
+    bias=None,
+):
+    return TritonLinearGELUFunction.apply(
+        x,
+        weight,
+        bias,
     )

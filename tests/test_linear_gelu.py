@@ -61,7 +61,7 @@ def test_case(use_bias):
     # Triton fused Linear + GELU
     # ========================================================
 
-    out = triton_linear_gelu_forward(
+    out_y, out_z = triton_linear_gelu_forward(
         x,
         weight,
         bias,
@@ -72,7 +72,7 @@ def test_case(use_bias):
     # ========================================================
 
     diff = (
-        out.float()
+        out_y.float()
         - ref.float()
     ).abs()
 
@@ -95,7 +95,7 @@ def test_case(use_bias):
     print(
         "allclose  :",
         torch.allclose(
-            out,
+            out_y,
             ref,
             atol=1e-2,
             rtol=1e-2,
