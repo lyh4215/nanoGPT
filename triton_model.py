@@ -219,16 +219,72 @@ class TritonMLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+
+        # parameter storage는 기존 nanoGPT와 동일
+        self.c_fc = nn.Linear(
+            config.n_embd,
+            4 * config.n_embd,
+            bias=config.bias,
+        )
+
+        self.gelu = nn.GELU()
+
+        self.c_proj = nn.Linear(
+            4 * config.n_embd,
+            config.n_embd,
+            bias=config.bias,
+        )
+
+        self.dropout = nn.Dropout(
+            config.dropout
+        )
 
     def forward(self, x):
-        x = self.c_fc(x)
+
+        # ====================================================
+        # 1. c_fc
+        #
+        # [B,T,C]
+        # →
+        # [B,T,4C]
+        # ====================================================
+
+        x = triton_linear(
+            x,
+            self.c_fc.weight,
+            self.c_fc.bias,
+        )
+
+        # ====================================================
+        # 2. GELU
+        #
+        # 일단 PyTorch GELU 그대로
+        #
+        # 이후 이 부분을 c_fc와 fusion 할 예정
+        # ====================================================
+
         x = self.gelu(x)
-        x = self.c_proj(x)
+
+        # ====================================================
+        # 3. c_proj
+        #
+        # [B,T,4C]
+        # →
+        # [B,T,C]
+        # ====================================================
+
+        x = triton_linear(
+            x,
+            self.c_proj.weight,
+            self.c_proj.bias,
+        )
+
+        # ====================================================
+        # 4. dropout
+        # ====================================================
+
         x = self.dropout(x)
+
         return x
 
 class TritonBlock(nn.Module):
