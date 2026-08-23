@@ -135,8 +135,6 @@ def _linear_gelu_fwd_kernel(
         stride_wn,
         stride_wk,
 
-        stride_zm,
-        stride_zn,
 
         BLOCK_M,
         BLOCK_N,
