@@ -11,7 +11,7 @@ from triton_kernels.linear import (
 def _gelu(x):
     return 0.5 * x * (
         1.0
-        + tl.libdevice.erf(
+        + tl.erf(
             x * 0.7071067811865476
         )
     )
