@@ -550,8 +550,8 @@ def triton_gelu_backward_with_db(
     # correctness + benchmark 후 sweep 가능.
     # ========================================================
 
-    BLOCK_M = 128
-    BLOCK_N = 16
+    BLOCK_M = 64
+    BLOCK_N = 128
 
     num_pid_m = triton.cdiv(
         M,
@@ -602,7 +602,7 @@ def triton_gelu_backward_with_db(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
 
-        num_warps=4,
+        num_warps=8,
     )
 
     # ========================================================
