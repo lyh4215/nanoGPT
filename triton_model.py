@@ -289,33 +289,72 @@ class TritonGPT(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+
         assert config.vocab_size is not None
         assert config.block_size is not None
+
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([TritonBlock(config) for _ in range(config.n_layer)]),
-            ln_f = TritonLayerNorm(config.n_embd, bias=config.bias),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(
+                    config.vocab_size,
+                    config.n_embd,
+                ),
+                wpe=nn.Embedding(
+                    config.block_size,
+                    config.n_embd,
+                ),
+                drop=nn.Dropout(
+                    config.dropout
+                ),
+                h=nn.ModuleList(
+                    [
+                        TritonBlock(config)
+                        for _ in range(
+                            config.n_layer
+                        )
+                    ]
+                ),
+                ln_f=TritonLayerNorm(
+                    config.n_embd,
+                    bias=config.bias,
+                ),
+            )
+        )
 
-        # init all weights
-        self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
+        self.lm_head = nn.Linear(
+            config.n_embd,
+            config.vocab_size,
+            bias=False,
+        )
+
+        # nanoGPT와 동일하게 token embedding과
+        # LM head weight tying
+        self.transformer.wte.weight = (
+            self.lm_head.weight
+        )
+
+        # initialize weights
+        self.apply(
+            self._init_weights
+        )
+
+        # nanoGPT의 residual projection 특별 초기화
         for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
-        # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+            if pn.endswith(
+                "c_proj.weight"
+            ):
+                torch.nn.init.normal_(
+                    p,
+                    mean=0.0,
+                    std=(
+                        0.02
+                        / math.sqrt(
+                            2 * config.n_layer
+                        )
+                    ),
+                )
 
     def get_num_params(self, non_embedding=True):
         """
@@ -329,35 +368,145 @@ class TritonGPT(nn.Module):
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def _init_weights(
+        self,
+        module,
+    ):
+        if isinstance(
+            module,
+            nn.Linear,
+        ):
+            torch.nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=0.02,
+            )
+
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                torch.nn.init.zeros_(
+                    module.bias
+                )
 
-    def forward(self, idx, targets=None):
+        elif isinstance(
+            module,
+            nn.Embedding,
+        ):
+            torch.nn.init.normal_(
+                module.weight,
+                mean=0.0,
+                std=0.02,
+            )
+
+    def forward(
+        self,
+        idx,
+        targets=None,
+    ):
         device = idx.device
-        b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        B, T = idx.shape
+
+        assert (
+            T <= self.config.block_size
+        ), (
+            f"Cannot forward sequence of "
+            f"length {T}, block size is "
+            f"{self.config.block_size}"
+        )
+
+        # ====================================================
+        # Position ids
+        # ====================================================
+
+        pos = torch.arange(
+            0,
+            T,
+            dtype=torch.long,
+            device=device,
+        )
+
+        # ====================================================
+        # Embedding
+        #
+        # idx     [B,T]
+        # tok_emb [B,T,C]
+        # pos_emb [T,C]
+        # ====================================================
+
+        tok_emb = (
+            self.transformer.wte(idx)
+        )
+
+        pos_emb = (
+            self.transformer.wpe(pos)
+        )
+
+        x = self.transformer.drop(
+            tok_emb + pos_emb
+        )
+
+        # ====================================================
+        # Transformer Blocks
+        # ====================================================
+
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+
+        # ====================================================
+        # Final LayerNorm
+        # ====================================================
+
+        x = self.transformer.ln_f(
+            x
+        )
+
+        # ====================================================
+        # LM Head
+        # ====================================================
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # Training:
+            # 모든 token의 logits 필요
+            #
+            # [B,T,768]
+            #      ↓
+            # [B,T,50304]
+
+            logits = triton_linear(
+                x,
+                self.lm_head.weight,
+                None,
+            )
+
+            # CE는 아직 PyTorch 사용
+            loss = F.cross_entropy(
+                logits.view(
+                    -1,
+                    logits.size(-1),
+                ),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # nanoGPT와 동일하게 inference에서는
+            # 마지막 token logits만 계산
+            #
+            # [B,T,C]
+            # ↓
+            # [B,1,C]
+
+            x_last = (
+                x[:, -1:, :]
+                .contiguous()
+            )
+
+            logits = triton_linear(
+                x_last,
+                self.lm_head.weight,
+                None,
+            )
+
             loss = None
 
         return logits, loss
