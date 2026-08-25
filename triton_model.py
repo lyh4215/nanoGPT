@@ -18,6 +18,9 @@ from torch.nn import functional as F
 from triton_kernels.layernorm import layer_norm_autograd
 from triton_kernels.attention import triton_flash_attention
 from triton_kernels.linear import triton_linear
+from triton_kernels.linear_gelu import (
+    triton_linear_gelu,
+)
 
 from model import GPTConfig
 
@@ -227,8 +230,6 @@ class TritonMLP(nn.Module):
             bias=config.bias,
         )
 
-        self.gelu = nn.GELU()
-
         self.c_proj = nn.Linear(
             4 * config.n_embd,
             config.n_embd,
@@ -241,29 +242,12 @@ class TritonMLP(nn.Module):
 
     def forward(self, x):
 
-        # ====================================================
-        # 1. c_fc
-        #
-        # [B,T,C]
-        # →
-        # [B,T,4C]
-        # ====================================================
-
-        x = triton_linear(
+        x = triton_linear_gelu(
             x,
             self.c_fc.weight,
             self.c_fc.bias,
         )
 
-        # ====================================================
-        # 2. GELU
-        #
-        # 일단 PyTorch GELU 그대로
-        #
-        # 이후 이 부분을 c_fc와 fusion 할 예정
-        # ====================================================
-
-        x = self.gelu(x)
 
         # ====================================================
         # 3. c_proj
