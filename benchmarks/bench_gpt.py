@@ -1,370 +1,289 @@
 import torch
 import triton
 
-from model import GPT, GPTConfig, CausalSelfAttention
+from model import (
+    GPT,
+    GPTConfig,
+)
 
+from triton_model import (
+    TritonGPT,
+)
 
-# ============================================================
-# Config
-# ============================================================
-
-B = 8
-T = 1024
 
 DEVICE = "cuda"
 DTYPE = torch.float16
 
-torch.manual_seed(0)
+B = 8
+T = 1024
 
 
-# ============================================================
-# Model
-# ============================================================
+def main():
+    torch.manual_seed(0)
+    torch.cuda.init()
 
-config = GPTConfig(
-    block_size=T,
-    vocab_size=50304,
-    n_layer=12,
-    n_head=12,
-    n_embd=768,
-    dropout=0.0,
-    bias=True,
-    use_triton_flash=False,
-)
+    # ========================================================
+    # Config
+    # ========================================================
 
-model = GPT(config).to(DEVICE)
-
-model.train()
-
-
-# ============================================================
-# Input
-# ============================================================
-
-x = torch.randint(
-    0,
-    config.vocab_size,
-    (B, T),
-    device=DEVICE,
-)
-
-targets = torch.randint(
-    0,
-    config.vocab_size,
-    (B, T),
-    device=DEVICE,
-)
-
-
-# ============================================================
-# Attention backend switch
-#
-# 같은 model / 같은 weight에서
-# attention implementation만 교체
-# ============================================================
-
-def set_triton_flash(model, enabled):
-    for module in model.modules():
-        if isinstance(module, CausalSelfAttention):
-            module.use_triton_flash = enabled
-
-
-# ============================================================
-# Gradient 저장
-# ============================================================
-
-def save_grads(model):
-    grads = {}
-
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grads[name] = param.grad.detach().clone()
-
-    return grads
-
-
-# ============================================================
-# Correctness
-# ============================================================
-
-def run_correctness():
-    print("=" * 70)
-    print("Correctness")
-    print("=" * 70)
-
-    #
-    # --------------------------------------------------------
-    # SDPA
-    # --------------------------------------------------------
-    #
-
-    set_triton_flash(
-        model,
-        False,
+    config = GPTConfig(
+        block_size=1024,
+        vocab_size=50304,
+        n_layer=12,
+        n_head=12,
+        n_embd=768,
+        dropout=0.0,
+        bias=True,
     )
 
-    model.zero_grad(
-        set_to_none=True,
-    )
+    # ========================================================
+    # Models
+    # ========================================================
 
-    with torch.autocast(
-        device_type="cuda",
+    eager_model = GPT(
+        config
+    ).to(
+        device=DEVICE,
         dtype=DTYPE,
-    ):
-        logits_sdpa, loss_sdpa = model(
-            x,
-            targets,
-        )
-
-    loss_sdpa.backward()
-
-    grads_sdpa = save_grads(model)
-
-    logits_sdpa = logits_sdpa.detach()
-    loss_sdpa_value = loss_sdpa.detach().item()
-
-    #
-    # --------------------------------------------------------
-    # Triton
-    # --------------------------------------------------------
-    #
-
-    set_triton_flash(
-        model,
-        True,
     )
 
-    model.zero_grad(
-        set_to_none=True,
-    )
-
-    with torch.autocast(
-        device_type="cuda",
+    triton_model = TritonGPT(
+        config
+    ).to(
+        device=DEVICE,
         dtype=DTYPE,
-    ):
-        logits_triton, loss_triton = model(
-            x,
-            targets,
+    )
+
+    triton_model.load_state_dict(
+        eager_model.state_dict()
+    )
+
+    eager_model.eval()
+    triton_model.eval()
+
+    # ========================================================
+    # torch.compile
+    #
+    # 같은 eager_model의 parameter를 사용.
+    # compile wrapper만 별도로 만든다.
+    # ========================================================
+
+    compiled_default = torch.compile(
+        eager_model,
+        backend="inductor",
+        mode="default",
+        dynamic=False,
+    )
+
+    compiled_max = torch.compile(
+        eager_model,
+        backend="inductor",
+        mode="max-autotune",
+        dynamic=False,
+    )
+
+    # ========================================================
+    # Input
+    # ========================================================
+
+    idx = torch.randint(
+        0,
+        config.vocab_size,
+        (B, T),
+        device=DEVICE,
+        dtype=torch.long,
+    )
+
+    # ========================================================
+    # Benchmark callables
+    #
+    # targets=None:
+    #
+    # nanoGPT inference path
+    # → 마지막 token에 대해서만 LM Head 계산
+    # ========================================================
+
+    @torch.inference_mode()
+    def eager_fn():
+        return eager_model(
+            idx
         )
 
-    loss_triton.backward()
-
-    grads_triton = save_grads(model)
-
-    logits_triton = logits_triton.detach()
-    loss_triton_value = loss_triton.detach().item()
-
-    #
-    # --------------------------------------------------------
-    # Compare output / loss
-    # --------------------------------------------------------
-    #
-
-    print()
-
-    print(
-        f"SDPA loss   : "
-        f"{loss_sdpa_value:.8f}"
-    )
-
-    print(
-        f"Triton loss : "
-        f"{loss_triton_value:.8f}"
-    )
-
-    print(
-        f"Loss diff   : "
-        f"{abs(loss_sdpa_value - loss_triton_value):.8e}"
-    )
-
-    print(
-        f"Logits max diff : "
-        f"{(logits_sdpa - logits_triton).abs().max().item():.8e}"
-    )
-
-    print()
-
-    #
-    # --------------------------------------------------------
-    # Parameter gradient compare
-    # --------------------------------------------------------
-    #
-
-    max_grad_diff = 0.0
-    max_grad_name = None
-
-    print("[Gradient diff]")
-
-    for name in grads_sdpa:
-        if name not in grads_triton:
-            continue
-
-        diff = (
-            grads_sdpa[name]
-            - grads_triton[name]
-        ).abs()
-
-        max_diff = diff.max().item()
-        mean_diff = diff.mean().item()
-
-        if max_diff > max_grad_diff:
-            max_grad_diff = max_diff
-            max_grad_name = name
-
-        print(
-            f"{name:50s} "
-            f"max={max_diff:.6e} "
-            f"mean={mean_diff:.6e}"
+    @torch.inference_mode()
+    def compile_default_fn():
+        return compiled_default(
+            idx
         )
 
-    print()
-
-    print(
-        f"Largest grad diff: "
-        f"{max_grad_name} "
-        f"({max_grad_diff:.6e})"
-    )
-
-
-# ============================================================
-# Benchmark
-# ============================================================
-
-def benchmark_backend(
-    use_triton,
-):
-    set_triton_flash(
-        model,
-        use_triton,
-    )
-
-    def fn():
-        model.zero_grad(
-            set_to_none=True,
+    @torch.inference_mode()
+    def compile_max_fn():
+        return compiled_max(
+            idx
         )
 
-        with torch.autocast(
-            device_type="cuda",
-            dtype=DTYPE,
-        ):
-            _, loss = model(
-                x,
-                targets,
-            )
+    @torch.inference_mode()
+    def triton_fn():
+        return triton_model(
+            idx
+        )
 
-        loss.backward()
-
-    return triton.testing.do_bench(
-        fn,
-    )
-
-
-# ============================================================
-# Optional: forward only
-# ============================================================
-
-def benchmark_forward(
-    use_triton,
-):
-    set_triton_flash(
-        model,
-        use_triton,
-    )
-
-    def fn():
-        with torch.no_grad():
-            with torch.autocast(
-                device_type="cuda",
-                dtype=DTYPE,
-            ):
-                model(
-                    x,
-                    targets,
-                )
-
-    return triton.testing.do_bench(
-        fn,
-    )
-
-
-# ============================================================
-# Run
-# ============================================================
-
-if __name__ == "__main__":
-
+    # ========================================================
+    # Compile + warmup
     #
-    # correctness
-    #
-    run_correctness()
+    # 중요:
+    # torch.compile 첫 호출에는 실제 compilation이 발생한다.
+    # 그 시간은 runtime benchmark에 넣지 않는다.
+    # ========================================================
 
-    model.zero_grad(
-        set_to_none=True,
-    )
+    print()
+    print("Compiling / warming up...")
 
-    torch.cuda.empty_cache()
+    eager_fn()
+
+    # first call triggers compile
+    compile_default_fn()
     torch.cuda.synchronize()
 
-    #
-    # forward only
-    #
-    sdpa_fwd_ms = benchmark_forward(
-        False,
+    compile_max_fn()
+    torch.cuda.synchronize()
+
+    # Triton JIT compilation
+    triton_fn()
+    torch.cuda.synchronize()
+
+    # runtime warmup
+    for _ in range(5):
+        eager_fn()
+        compile_default_fn()
+        compile_max_fn()
+        triton_fn()
+
+    torch.cuda.synchronize()
+
+    # ========================================================
+    # Benchmark
+    # ========================================================
+
+    eager_ms = triton.testing.do_bench(
+        eager_fn
     )
 
-    triton_fwd_ms = benchmark_forward(
-        True,
+    default_ms = triton.testing.do_bench(
+        compile_default_fn
     )
 
-    #
-    # forward + backward
-    #
-    sdpa_fb_ms = benchmark_backend(
-        False,
+    max_ms = triton.testing.do_bench(
+        compile_max_fn
     )
 
-    triton_fb_ms = benchmark_backend(
-        True,
+    triton_ms = triton.testing.do_bench(
+        triton_fn
+    )
+
+    # ========================================================
+    # Results
+    # ========================================================
+
+    print()
+    print("=" * 100)
+
+    print(
+        f"GPT Inference Benchmark "
+        f"B={B}, T={T}, "
+        f"C={config.n_embd}, "
+        f"layers={config.n_layer}"
+    )
+
+    print("=" * 100)
+
+    print()
+
+    print(
+        f"{'Implementation':<32} "
+        f"{'Latency':>12} "
+        f"{'vs Eager':>12}"
+    )
+
+    print("-" * 60)
+
+    print(
+        f"{'PyTorch eager':<32} "
+        f"{eager_ms:>9.4f} ms "
+        f"{1.0:>11.2f}x"
+    )
+
+    print(
+        f"{'torch.compile(default)':<32} "
+        f"{default_ms:>9.4f} ms "
+        f"{eager_ms / default_ms:>11.2f}x"
+    )
+
+    print(
+        f"{'torch.compile(max-autotune)':<32} "
+        f"{max_ms:>9.4f} ms "
+        f"{eager_ms / max_ms:>11.2f}x"
+    )
+
+    print(
+        f"{'TritonGPT':<32} "
+        f"{triton_ms:>9.4f} ms "
+        f"{eager_ms / triton_ms:>11.2f}x"
+    )
+
+    # ========================================================
+    # Compare Triton directly against compiled PyTorch
+    # ========================================================
+
+    print()
+    print("=" * 100)
+    print("TritonGPT vs torch.compile")
+    print("=" * 100)
+
+    print()
+
+    print(
+        "vs compile(default)      : "
+        f"{default_ms / triton_ms:.2f}x"
+    )
+
+    print(
+        "vs compile(max-autotune) : "
+        f"{max_ms / triton_ms:.2f}x"
+    )
+
+    # ========================================================
+    # Winner
+    # ========================================================
+
+    results = {
+        "PyTorch eager":
+            eager_ms,
+
+        "torch.compile(default)":
+            default_ms,
+
+        "torch.compile(max-autotune)":
+            max_ms,
+
+        "TritonGPT":
+            triton_ms,
+    }
+
+    winner = min(
+        results,
+        key=results.get,
     )
 
     print()
-    print("=" * 70)
-    print(
-        f"nanoGPT benchmark "
-        f"B={B}, T={T}"
-    )
-    print("=" * 70)
-
-    print("\n[Forward only]")
+    print("=" * 100)
+    print("BEST")
+    print("=" * 100)
 
     print(
-        f"SDPA             : "
-        f"{sdpa_fwd_ms:.4f} ms"
+        f"{winner}: "
+        f"{results[winner]:.4f} ms"
     )
 
-    print(
-        f"Triton Flash     : "
-        f"{triton_fwd_ms:.4f} ms"
-    )
 
-    print(
-        f"Speedup          : "
-        f"{sdpa_fwd_ms / triton_fwd_ms:.2f}x"
-    )
-
-    print("\n[Forward + Backward]")
-
-    print(
-        f"SDPA             : "
-        f"{sdpa_fb_ms:.4f} ms"
-    )
-
-    print(
-        f"Triton Flash     : "
-        f"{triton_fb_ms:.4f} ms"
-    )
-
-    print(
-        f"Speedup          : "
-        f"{sdpa_fb_ms / triton_fb_ms:.2f}x"
-    )
+if __name__ == "__main__":
+    main()
