@@ -288,6 +288,12 @@ def main():
             None,
         )
 
+        n_spills = getattr(
+            compiled,
+            "n_spills",
+            None,
+        )
+
         shared = getattr(
             compiled.metadata,
             "shared",
@@ -456,6 +462,7 @@ def main():
             "S": cfg["S"],
 
             "n_regs": n_regs,
+            "n_spills": n_spills,
             "shared": shared,
 
             "reg_occ":
@@ -507,6 +514,11 @@ def main():
         print(
             f"registers/thread    : "
             f"{n_regs}"
+        )
+
+        print(
+            f"register spills     : "
+            f"{n_spills}"
         )
 
         print(
@@ -641,6 +653,7 @@ def main():
         f"{'STG':>7}"
         f"{'LDL':>7} "
         f"{'STL':>7} "
+        f"{'Spills':>8} "
     )
 
     print("-" * 100)
@@ -659,6 +672,7 @@ def main():
             f"{str(r['STG']):>7}"
             f"{str(r['LDL']):>7} "
             f"{str(r['STL']):>7} "
+            f"{str(r['n_spills']):>8} "
         )
 
     print()
