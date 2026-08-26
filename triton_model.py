@@ -21,6 +21,9 @@ from triton_kernels.linear import triton_linear
 from triton_kernels.linear_gelu import (
     triton_linear_gelu,
 )
+from triton_kernels.linear_residual import (
+    triton_linear_residual,
+)
 
 from model import GPTConfig
 
@@ -81,21 +84,12 @@ class TritonCausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
 
-    def forward(self, x):
-
+    def forward(
+        self,
+        x,
+        residual=None,
+    ):
         B, T, C = x.size()
-
-        # ====================================================
-        # 1. QKV projection
-        #
-        # PyTorch:
-        #
-        # q, k, v = self.c_attn(x).split(C, dim=2)
-        #
-        # ↓
-        #
-        # Triton Linear
-        # ====================================================
 
         qkv = triton_linear(
             x,
@@ -104,21 +98,16 @@ class TritonCausalSelfAttention(nn.Module):
         )
 
         q, k, v = qkv.split(
-            C,
+            self.n_embd,
             dim=2,
         )
-
-        # ====================================================
-        # 2. [B,T,C] -> [B,H,T,D]
-        # ====================================================
 
         head_dim = (
             C // self.n_head
         )
 
         q = (
-            q
-            .view(
+            q.view(
                 B,
                 T,
                 self.n_head,
@@ -128,8 +117,7 @@ class TritonCausalSelfAttention(nn.Module):
         )
 
         k = (
-            k
-            .view(
+            k.view(
                 B,
                 T,
                 self.n_head,
@@ -139,8 +127,7 @@ class TritonCausalSelfAttention(nn.Module):
         )
 
         v = (
-            v
-            .view(
+            v.view(
                 B,
                 T,
                 self.n_head,
@@ -149,21 +136,10 @@ class TritonCausalSelfAttention(nn.Module):
             .transpose(1, 2)
         )
 
-        # ====================================================
-        # 3. FlashAttention
-        #
-        # q,k,v:
-        # [B,H,T,D]
-        #
-        # output:
-        # [B,H,T,D]
-        # ====================================================
-
-        # 현재 Triton FlashAttention에는
-        # attention dropout이 구현되어 있지 않음.
-        #
-        # correctness 비교는 dropout=0.0에서 하자.
-        if self.training and self.dropout != 0.0:
+        if (
+            self.training
+            and self.dropout != 0.0
+        ):
             raise NotImplementedError(
                 "Triton FlashAttention currently "
                 "does not support attention dropout"
@@ -175,32 +151,38 @@ class TritonCausalSelfAttention(nn.Module):
             v,
         )
 
-        # ====================================================
-        # 4. [B,H,T,D] -> [B,T,C]
-        # ====================================================
-
         y = (
-            y
-            .transpose(1, 2)
+            y.transpose(1, 2)
             .contiguous()
-            .view(
-                B,
-                T,
-                C,
-            )
+            .view(B, T, C)
         )
 
-        # 여기 contiguous()가 중요.
-        #
-        # transpose 이후:
-        # [B,T,H,D]는 strided view이고
-        #
-        # 현재 triton_linear_forward는
-        # x.is_contiguous()를 요구함.
+        # ========================================================
+        # c_proj + residual fusion
+        # ========================================================
 
-        # ====================================================
-        # 5. Output projection
-        # ====================================================
+        if (
+            residual is not None
+            and self.dropout == 0.0
+        ):
+            y = triton_linear_residual(
+                y,
+                self.c_proj.weight,
+                self.c_proj.bias,
+                residual,
+            )
+
+            return y
+
+        # ========================================================
+        # fallback
+        #
+        # dropout != 0이면 원래 semantics:
+        #
+        # residual + dropout(c_proj(y))
+        #
+        # 를 유지해야 함.
+        # ========================================================
 
         y = triton_linear(
             y,
@@ -208,16 +190,14 @@ class TritonCausalSelfAttention(nn.Module):
             self.c_proj.bias,
         )
 
-        # ====================================================
-        # 6. residual dropout
-        #
-        # 이건 일단 PyTorch 그대로.
-        # ====================================================
+        y = self.resid_dropout(
+            y
+        )
 
-        y = self.resid_dropout(y)
+        if residual is not None:
+            y = residual + y
 
         return y
-
 class TritonMLP(nn.Module):
 
     def __init__(self, config):
@@ -240,7 +220,14 @@ class TritonMLP(nn.Module):
             config.dropout
         )
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        residual=None,
+    ):
+        # ========================================================
+        # c_fc + GELU
+        # ========================================================
 
         x = triton_linear_gelu(
             x,
@@ -248,14 +235,26 @@ class TritonMLP(nn.Module):
             self.c_fc.bias,
         )
 
+        # ========================================================
+        # c_proj + residual
+        # ========================================================
 
-        # ====================================================
-        # 3. c_proj
-        #
-        # [B,T,4C]
-        # →
-        # [B,T,C]
-        # ====================================================
+        if (
+            residual is not None
+            and self.dropout.p == 0.0
+        ):
+            x = triton_linear_residual(
+                x,
+                self.c_proj.weight,
+                self.c_proj.bias,
+                residual,
+            )
+
+            return x
+
+        # ========================================================
+        # fallback
+        # ========================================================
 
         x = triton_linear(
             x,
@@ -263,11 +262,12 @@ class TritonMLP(nn.Module):
             self.c_proj.bias,
         )
 
-        # ====================================================
-        # 4. dropout
-        # ====================================================
+        x = self.dropout(
+            x
+        )
 
-        x = self.dropout(x)
+        if residual is not None:
+            x = residual + x
 
         return x
 
@@ -281,8 +281,17 @@ class TritonBlock(nn.Module):
         self.mlp = TritonMLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+
+        x = self.attn(
+            self.ln_1(x),
+            residual=x,
+        )
+
+        x = self.mlp(
+            self.ln_2(x),
+            residual=x,
+        )
+
         return x
 
 class TritonGPT(nn.Module):
