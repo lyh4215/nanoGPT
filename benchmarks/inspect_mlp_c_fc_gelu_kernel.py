@@ -430,6 +430,15 @@ def main():
                 sass,
                 "BAR"
             )
+            ldl = count_instruction(
+                sass,
+                "LDL"
+            )
+
+            stl = count_instruction(
+                sass,
+                "STL"
+            )
 
         else:
             hmma = ffma = None
@@ -471,6 +480,8 @@ def main():
             "LDS": lds,
             "STS": sts,
             "BAR": bar,
+            "LDL": ldl,
+            "STL": stl,
         }
 
         results.append(
@@ -568,6 +579,15 @@ def main():
             f"BAR                 : "
             f"{bar}"
         )
+        print(
+            f"LDL                 : "
+            f"{ldl}"
+        )
+
+        print(
+            f"STL                 : "
+            f"{stl}"
+        )
 
         # ----------------------------------------------------
         # 실제 HMMA 몇 줄 출력
@@ -619,6 +639,8 @@ def main():
         f"{'FFMA':>7} "
         f"{'LDG':>7} "
         f"{'STG':>7}"
+        f"{'LDL':>7} "
+        f"{'STL':>7} "
     )
 
     print("-" * 100)
@@ -635,14 +657,46 @@ def main():
             f"{str(r['FFMA']):>7} "
             f"{str(r['LDG']):>7} "
             f"{str(r['STG']):>7}"
+            f"{str(r['LDL']):>7} "
+            f"{str(r['STL']):>7} "
         )
 
     print()
+    local_lines = get_local_memory_lines(
+        sass
+    )
+
+    print()
+    print(
+        "Local-memory instructions:"
+    )
+
+    for line in local_lines[:30]:
+        print(
+            "  " + line
+        )
     print(
         f"ASM dumps written to: "
         f"{output_dir}"
     )
 
+
+def get_local_memory_lines(
+    sass,
+):
+    keywords = (
+        "LDL",
+        "STL",
+    )
+
+    return [
+        line.strip()
+        for line in sass.splitlines()
+        if any(
+            keyword in line
+            for keyword in keywords
+        )
+    ]
 
 if __name__ == "__main__":
     main()
