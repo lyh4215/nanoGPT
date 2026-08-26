@@ -155,6 +155,12 @@ def main():
         )
     )
 
+    torch_props = (
+        torch.cuda.get_device_properties(
+            device
+        )
+    )
+
     print()
     print("=" * 100)
     print("GPU")
@@ -173,7 +179,7 @@ def main():
             f"{key:<30}: {value}"
         )
 
-    # Triton tutorial에서 사용하는 property names
+    # Triton properties
     num_sm = props[
         "multiprocessor_count"
     ]
@@ -190,9 +196,17 @@ def main():
         "warpSize"
     ]
 
-    max_threads_per_sm = props[
-        "max_threads_per_sm"
-    ]
+    # PyTorch CUDA device properties
+    max_threads_per_sm = (
+        torch_props
+        .max_threads_per_multi_processor
+    )
+
+    print()
+    print(
+        f"{'max_threads_per_sm':<30}: "
+        f"{max_threads_per_sm}"
+    )
 
     # ========================================================
     # Tensors
