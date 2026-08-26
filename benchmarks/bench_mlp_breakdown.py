@@ -10,6 +10,10 @@ from triton_model import (
     TritonBlock,
 )
 
+from triton_kernels.linear import (
+    triton_linear,
+)
+
 from triton_kernels.linear_gelu import (
     triton_linear_gelu,
 )
@@ -27,13 +31,26 @@ T = 1024
 C = 768
 
 
+# ============================================================
+# Benchmark helper
+#
+# Forward 성능만 보고 있으므로 autograd / graph 생성 완전히 제거
+# ============================================================
+
 def bench(fn):
-    for _ in range(3):
-        fn()
+    def run():
+        with torch.inference_mode():
+            return fn()
+
+    # warmup
+    for _ in range(10):
+        run()
 
     torch.cuda.synchronize()
 
-    return triton.testing.do_bench(fn)
+    return triton.testing.do_bench(
+        run
+    )
 
 
 def print_row(
@@ -70,7 +87,7 @@ def main():
     # ========================================================
     # Blocks
     #
-    # MLP parameter 구조가 동일하므로 Block 하나만 생성
+    # 같은 weight를 사용하도록 state_dict 복사
     # ========================================================
 
     ref_block = Block(
@@ -100,7 +117,7 @@ def main():
     # ========================================================
     # Input
     #
-    # 실제 MLP가 받는 LN 출력과 동일한 shape
+    # 실제 MLP input shape:
     #
     # [B, T, 768]
     # ========================================================
@@ -121,7 +138,6 @@ def main():
         dtype=DTYPE,
     )
 
-    # 동일한 입력 사용
     ref_x = x.clone()
     tri_x = x.clone()
 
@@ -129,18 +145,38 @@ def main():
     tri_residual = residual.clone()
 
     # ========================================================
-    # Prepare hidden
+    # Prepare intermediate values
     #
-    # stage 2를 측정할 때 stage 1 비용이 섞이지 않도록
-    # 미리 c_fc + GELU 결과 계산
+    # 각 component benchmark에서 이전 stage 비용이
+    # 섞이지 않도록 미리 결과를 생성.
     # ========================================================
 
-    with torch.no_grad():
+    with torch.inference_mode():
+
+        # ----------------------------------------------------
+        # c_fc outputs
+        #
+        # [B,T,768] -> [B,T,3072]
+        # ----------------------------------------------------
+
+        ref_fc_output = ref_mlp.c_fc(
+            ref_x
+        )
+
+        tri_fc_output = triton_linear(
+            tri_x,
+            tri_mlp.c_fc.weight,
+            tri_mlp.c_fc.bias,
+        )
+
+        # ----------------------------------------------------
+        # c_fc + GELU outputs
+        #
+        # c_proj의 입력으로 사용
+        # ----------------------------------------------------
 
         ref_hidden = ref_mlp.gelu(
-            ref_mlp.c_fc(
-                ref_x
-            )
+            ref_fc_output
         )
 
         tri_hidden = triton_linear_gelu(
@@ -149,30 +185,40 @@ def main():
             tri_mlp.c_fc.bias,
         )
 
+        # ----------------------------------------------------
+        # c_proj outputs
+        #
+        # [B,T,3072] -> [B,T,768]
+        # ----------------------------------------------------
+
+        ref_proj_output = ref_mlp.c_proj(
+            ref_hidden
+        )
+
+        tri_proj_output = triton_linear(
+            tri_hidden,
+            tri_mlp.c_proj.weight,
+            tri_mlp.c_proj.bias,
+        )
+
     torch.cuda.synchronize()
 
     # ========================================================
-    # ① c_fc + GELU
     #
-    # PyTorch:
-    # Linear(768 -> 3072)
-    # +
-    # exact GELU
+    # 1. c_fc + GELU
     #
-    # Triton:
-    # fused Linear + exact GELU
     # ========================================================
 
     def ref_fc_gelu():
-        x = ref_mlp.c_fc(
+        y = ref_mlp.c_fc(
             ref_x
         )
 
-        x = ref_mlp.gelu(
-            x
+        y = ref_mlp.gelu(
+            y
         )
 
-        return x
+        return y
 
     def tri_fc_gelu():
         return triton_linear_gelu(
@@ -182,25 +228,34 @@ def main():
         )
 
     # ========================================================
-    # ② c_proj + Residual
+    #
+    # 2. c_proj + Residual
     #
     # PyTorch:
     #
-    # Linear(3072 -> 768)
-    # → residual add
+    #   c_proj
+    #       ↓
+    #   temporary output
+    #       ↓
+    #   residual add
     #
     # Triton:
     #
-    # Linear + residual fused epilogue
+    #   GEMM accumulator
+    #       ↓
+    #   residual add
+    #       ↓
+    #   one final store
+    #
     # ========================================================
 
     def ref_proj_residual():
-        x = ref_mlp.c_proj(
+        y = ref_mlp.c_proj(
             ref_hidden
         )
 
         return (
-            x
+            y
             + ref_residual
         )
 
@@ -213,17 +268,19 @@ def main():
         )
 
     # ========================================================
-    # Full MLP + Residual
+    #
+    # 3. Full MLP + Residual
+    #
     # ========================================================
 
     def ref_full():
-        x = ref_mlp(
+        y = ref_mlp(
             ref_x
         )
 
         return (
-            ref_residual
-            + x
+            y
+            + ref_residual
         )
 
     def tri_full():
@@ -233,22 +290,21 @@ def main():
         )
 
     # ========================================================
-    # Optional finer PyTorch breakdown
     #
-    # c_fc 자체와 GELU 자체도 따로 측정해서
-    # ①이 느리다면 GEMM인지 GELU인지 확인.
+    # c_fc detail
+    #
     # ========================================================
-
-    with torch.no_grad():
-        ref_fc_output = ref_mlp.c_fc(
-            ref_x
-        )
-
-    torch.cuda.synchronize()
 
     def ref_fc_only():
         return ref_mlp.c_fc(
             ref_x
+        )
+
+    def tri_fc_only():
+        return triton_linear(
+            tri_x,
+            tri_mlp.c_fc.weight,
+            tri_mlp.c_fc.bias,
         )
 
     def ref_gelu_only():
@@ -257,8 +313,79 @@ def main():
         )
 
     # ========================================================
-    # Benchmark
+    #
+    # c_proj detail
+    #
     # ========================================================
+
+    def ref_proj_only():
+        return ref_mlp.c_proj(
+            ref_hidden
+        )
+
+    def tri_proj_only():
+        return triton_linear(
+            tri_hidden,
+            tri_mlp.c_proj.weight,
+            tri_mlp.c_proj.bias,
+        )
+
+    # ========================================================
+    #
+    # Residual add only
+    #
+    # 둘 다 torch add를 사용.
+    #
+    # 입력 tensor만 각각 자기 implementation에서 만들어진
+    # projection output을 사용.
+    #
+    # ========================================================
+
+    def ref_residual_only():
+        return (
+            ref_proj_output
+            + ref_residual
+        )
+
+    def tri_residual_only():
+        return (
+            tri_proj_output
+            + tri_residual
+        )
+
+    # ========================================================
+    #
+    # Triton unfused c_proj + residual
+    #
+    # 기존 구조:
+    #
+    # triton_linear
+    #       ↓
+    # temporary HBM store
+    #       ↓
+    # torch residual add
+    #
+    # ========================================================
+
+    def tri_proj_residual_unfused():
+        y = triton_linear(
+            tri_hidden,
+            tri_mlp.c_proj.weight,
+            tri_mlp.c_proj.bias,
+        )
+
+        return (
+            y
+            + tri_residual
+        )
+
+    # ========================================================
+    # Benchmarks
+    # ========================================================
+
+    # --------------------------------------------------------
+    # Main
+    # --------------------------------------------------------
 
     ref_fc_gelu_ms = bench(
         ref_fc_gelu
@@ -284,16 +411,50 @@ def main():
         tri_full
     )
 
+    # --------------------------------------------------------
+    # c_fc detail
+    # --------------------------------------------------------
+
     ref_fc_only_ms = bench(
         ref_fc_only
+    )
+
+    tri_fc_only_ms = bench(
+        tri_fc_only
     )
 
     ref_gelu_only_ms = bench(
         ref_gelu_only
     )
 
+    # --------------------------------------------------------
+    # c_proj detail
+    # --------------------------------------------------------
+
+    ref_proj_only_ms = bench(
+        ref_proj_only
+    )
+
+    tri_proj_only_ms = bench(
+        tri_proj_only
+    )
+
+    ref_residual_only_ms = bench(
+        ref_residual_only
+    )
+
+    tri_residual_only_ms = bench(
+        tri_residual_only
+    )
+
+    tri_proj_residual_unfused_ms = bench(
+        tri_proj_residual_unfused
+    )
+
     # ========================================================
+    #
     # Main breakdown
+    #
     # ========================================================
 
     print()
@@ -336,7 +497,9 @@ def main():
     )
 
     # ========================================================
+    #
     # Component sum
+    #
     # ========================================================
 
     ref_sum = (
@@ -379,34 +542,159 @@ def main():
     )
 
     # ========================================================
-    # PyTorch c_fc / GELU detail
+    #
+    # c_fc + GELU detail
+    #
     # ========================================================
 
     print()
     print("=" * 92)
-    print("PyTorch c_fc + GELU Detail")
+    print("c_fc + GELU Detail")
     print("=" * 92)
 
     print()
 
     print(
-        f"c_fc only     : "
-        f"{ref_fc_only_ms:.4f} ms"
+        f"{'Operation':<32} "
+        f"{'PyTorch':>10} "
+        f"{'Triton':>10} "
+        f"{'Speedup':>9}"
     )
 
+    print("-" * 66)
+
+    print_row(
+        "c_fc only",
+        ref_fc_only_ms,
+        tri_fc_only_ms,
+    )
+
+    print()
+
     print(
-        f"GELU only     : "
+        f"PyTorch GELU only     : "
         f"{ref_gelu_only_ms:.4f} ms"
     )
 
+    print()
+
     print(
-        f"Separate sum  : "
+        f"PyTorch c_fc + GELU separate sum : "
         f"{ref_fc_only_ms + ref_gelu_only_ms:.4f} ms"
     )
 
     print(
-        f"Combined bench: "
+        f"PyTorch combined benchmark        : "
         f"{ref_fc_gelu_ms:.4f} ms"
+    )
+
+    print(
+        f"Triton fused c_fc + GELU          : "
+        f"{tri_fc_gelu_ms:.4f} ms"
+    )
+
+    # ========================================================
+    #
+    # c_proj detail
+    #
+    # ========================================================
+
+    print()
+    print("=" * 92)
+    print("c_proj + Residual Detail")
+    print("=" * 92)
+
+    print()
+
+    print(
+        f"{'Operation':<32} "
+        f"{'PyTorch':>10} "
+        f"{'Triton':>10} "
+        f"{'Speedup':>9}"
+    )
+
+    print("-" * 66)
+
+    print_row(
+        "c_proj only",
+        ref_proj_only_ms,
+        tri_proj_only_ms,
+    )
+
+    print_row(
+        "Residual add only",
+        ref_residual_only_ms,
+        tri_residual_only_ms,
+    )
+
+    # ========================================================
+    # Separate vs fused
+    # ========================================================
+
+    print()
+    print("-" * 92)
+    print("c_proj + Residual Paths")
+    print("-" * 92)
+
+    print()
+
+    ref_separate_sum = (
+        ref_proj_only_ms
+        + ref_residual_only_ms
+    )
+
+    tri_separate_sum = (
+        tri_proj_only_ms
+        + tri_residual_only_ms
+    )
+
+    print(
+        f"PyTorch separate component sum : "
+        f"{ref_separate_sum:.4f} ms"
+    )
+
+    print(
+        f"PyTorch combined benchmark      : "
+        f"{ref_proj_residual_ms:.4f} ms"
+    )
+
+    print()
+
+    print(
+        f"Triton separate component sum  : "
+        f"{tri_separate_sum:.4f} ms"
+    )
+
+    print(
+        f"Triton unfused actual path      : "
+        f"{tri_proj_residual_unfused_ms:.4f} ms"
+    )
+
+    print(
+        f"Triton fused actual path        : "
+        f"{tri_proj_residual_ms:.4f} ms"
+    )
+
+    print()
+
+    fusion_saved = (
+        tri_proj_residual_unfused_ms
+        - tri_proj_residual_ms
+    )
+
+    fusion_speedup = (
+        tri_proj_residual_unfused_ms
+        / tri_proj_residual_ms
+    )
+
+    print(
+        f"Triton fusion speedup : "
+        f"{fusion_speedup:.2f}x"
+    )
+
+    print(
+        f"Triton fusion saved   : "
+        f"{fusion_saved:.4f} ms"
     )
 
 
