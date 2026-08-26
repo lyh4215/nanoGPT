@@ -11,6 +11,16 @@ from triton_kernels.linear import (
     triton_linear_backward_db,
 )
 
+def _get_linear_residual_fwd_config(K, N):
+    # attention c_proj
+    if K == 768 and N == 768:
+        return 128, 128, 64, 4, 4
+
+    # MLP c_proj
+    if K == 3072 and N == 768:
+        return 128, 128, 32, 4, 1
+
+    return 128, 128, 32, 4, 1
 
 # ============================================================
 # Forward kernel
@@ -268,10 +278,7 @@ def triton_linear_residual_forward(
         block_k,
         num_warps,
         group_size_m,
-    ) = _get_linear_fwd_config(
-        K,
-        N,
-    )
+    ) = _get_linear_residual_fwd_config(K, N)
 
     grid = (
         triton.cdiv(M, block_m)
