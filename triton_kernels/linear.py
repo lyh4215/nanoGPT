@@ -12,7 +12,14 @@ def _get_linear_fwd_config(K, N):
         return 128, 128, 32, 4, 1
 
     if K == 768 and N == 3072:
-        return 128, 128, 32, 4, 4
+        return (
+            128,  # BLOCK_M
+            128,  # BLOCK_N
+            64,   # BLOCK_K
+            4,    # num_warps
+            8,    # GROUP_SIZE_M
+            3,    # num_stages
+        )
 
     if K == 3072 and N == 768:
         return 128, 128, 32, 4, 2
